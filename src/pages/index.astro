@@ -1,17 +1,127 @@
 ---
+import BaseLayout from '../layouts/BaseLayout.astro';
 
+const projects = [
+  {
+    title: 'OpenClaw Memory Chain',
+    description: 'Cryptographic memory system for AI agents with blockchain anchoring',
+    tech: ['TypeScript', 'Ed25519', 'Base', 'WITNESS Token'],
+    status: 'Active',
+    link: 'https://github.com/SeMmyT/openclaw-memory-chain'
+  },
+  {
+    title: 'zohcli',
+    description: 'Go CLI for Zoho Mail & Admin APIs with OAuth2 support',
+    tech: ['Go', 'OAuth2', 'CLI'],
+    status: 'Active',
+    link: 'https://github.com/SeMmyT/zohcli'
+  },
+  {
+    title: 'Govantazh',
+    description: 'Multi-tenant cargo management SaaS platform',
+    tech: ['TypeScript', 'React 19', 'Hono', 'SQLite', 'Kysely'],
+    status: 'In Development',
+    link: '#'
+  },
+  {
+    title: 'Claude Code Skills',
+    description: 'Collection of professional skills for Claude Code',
+    tech: ['JavaScript', 'AI Agents', 'TDD'],
+    status: 'Active',
+    link: 'https://github.com/SeMmyT/gsd-tdd'
+  }
+];
 ---
 
-<html lang="en">
-	<head>
-		<meta charset="utf-8" />
-		<link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-		<link rel="icon" href="/favicon.ico" />
-		<meta name="viewport" content="width=device-width" />
-		<meta name="generator" content={Astro.generator} />
-		<title>Astro</title>
-	</head>
-	<body>
-		<h1>Astro</h1>
-	</body>
-</html>
+<BaseLayout>
+  <!-- Hero Section -->
+  <section class="max-w-6xl mx-auto px-6 py-20">
+    <div class="max-w-3xl">
+      <h1 class="text-5xl md:text-6xl font-bold mb-6 bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+        Daniel Petrushevsky
+      </h1>
+      <p class="text-2xl md:text-3xl text-gray-300 mb-8">
+        Day sales, night tools <span class="text-gray-500">(not objects)</span> builder.
+        <br />
+        Ex-Dota enjoyer.
+      </p>
+      <p class="text-lg text-gray-400 mb-8 max-w-2xl">
+        Building AI agent tools and SaaS platforms from Kyiv, Ukraine 🇺🇦. 
+        Currently exploring cryptographic memory systems and autonomous agent workflows.
+      </p>
+      <div class="flex gap-4">
+        <a 
+          href="/#projects" 
+          class="px-6 py-3 bg-cyan-500 text-gray-950 rounded-lg font-semibold hover:bg-cyan-400 transition-colors"
+        >
+          View Projects
+        </a>
+        <a 
+          href="/blog" 
+          class="px-6 py-3 border border-cyan-500 text-cyan-400 rounded-lg font-semibold hover:bg-cyan-500/10 transition-colors"
+        >
+          Read Blog
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- Projects Section -->
+  <section id="projects" class="max-w-6xl mx-auto px-6 py-20">
+    <h2 class="text-4xl font-bold mb-12">Featured Projects</h2>
+    <div class="grid md:grid-cols-2 gap-6">
+      {projects.map((project) => (
+        <a 
+          href={project.link}
+          target={project.link.startsWith('http') ? '_blank' : undefined}
+          rel={project.link.startsWith('http') ? 'noopener noreferrer' : undefined}
+          class="p-6 border border-gray-800 rounded-lg hover:border-cyan-500 transition-colors group"
+        >
+          <div class="flex justify-between items-start mb-4">
+            <h3 class="text-xl font-bold group-hover:text-cyan-400 transition-colors">
+              {project.title}
+            </h3>
+            <span class={`text-sm px-2 py-1 rounded ${
+              project.status === 'Active' 
+                ? 'bg-green-500/20 text-green-400' 
+                : 'bg-yellow-500/20 text-yellow-400'
+            }`}>
+              {project.status}
+            </span>
+          </div>
+          <p class="text-gray-400 mb-4">
+            {project.description}
+          </p>
+          <div class="flex flex-wrap gap-2">
+            {project.tech.map((tech) => (
+              <span class="text-xs px-2 py-1 bg-gray-800 text-gray-300 rounded">
+                {tech}
+              </span>
+            ))}
+          </div>
+        </a>
+      ))}
+    </div>
+  </section>
+
+  <!-- Current Focus -->
+  <section class="max-w-6xl mx-auto px-6 py-20">
+    <div class="border border-gray-800 rounded-lg p-8">
+      <h2 class="text-2xl font-bold mb-4">What I'm Building Now</h2>
+      <div class="space-y-4 text-gray-400">
+        <p>
+          <strong class="text-cyan-400">Memory Chain:</strong> Cryptographic proof system for AI agent memories. 
+          Every memory is timestamped, Ed25519 signed, hash-linked, and optionally anchored to Base blockchain via WITNESS token.
+        </p>
+        <p>
+          <strong class="text-cyan-400">Govantazh:</strong> Multi-tenant cargo management SaaS. 
+          Migrated from Firebase to SQLite-based multi-tenant architecture. Ships Monday.
+        </p>
+        <p>
+          <strong class="text-cyan-400">AI Agent Workflows:</strong> Building Claude Code skills and exploring autonomous agent patterns. 
+          Contributing to the OpenClaw ecosystem.
+        </p>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

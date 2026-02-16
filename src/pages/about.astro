@@ -1,0 +1,134 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+
+<BaseLayout title="About — Daniel Petrushevsky (SeMmy)">
+  <section class="max-w-4xl mx-auto px-6 py-20">
+    <h1 class="text-5xl font-bold mb-8 bg-gradient-to-r from-cyan-400 to-blue-500 bg-clip-text text-transparent">
+      About Me
+    </h1>
+    
+    <div class="prose prose-invert prose-lg max-w-none">
+      <div class="space-y-6 text-gray-300">
+        <p class="text-xl text-gray-400 italic">
+          "Day sales, night tools (not objects) builder. Ex-Dota enjoyer."
+        </p>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">The Story</h2>
+        
+        <p>
+          I'm Daniel Petrushevsky (also Petrushevskyi), known online as <strong class="text-cyan-400">SeMmy</strong>. 
+          I live in Kyiv, Ukraine 🇺🇦, where I split my time between a day job in sales and night-time passion for building tools.
+        </p>
+
+        <p>
+          My journey started with gaming — specifically <strong>Dota 2</strong>, where I played competitively as 
+          "Worst Timber EU" (my main hero was Timbersaw). Gaming taught me strategic thinking, 
+          rapid decision-making under pressure, and the value of community. Those skills translate 
+          directly to software development and product building.
+        </p>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">Career Arc</h2>
+        
+        <p>
+          <strong class="text-cyan-400">Sales by day:</strong> I work as a Sales Manager at SignalHire, 
+          focusing on competitive intelligence and API integration. This gives me insights into B2B SaaS, 
+          customer needs, and what actually makes products successful.
+        </p>
+
+        <p>
+          <strong class="text-cyan-400">Builder by night:</strong> After hours, I build tools. 
+          Not objects — tools. Things that solve real problems:
+        </p>
+        
+        <ul class="list-disc list-inside space-y-2 ml-4">
+          <li><strong>Govantazh</strong> — Multi-tenant cargo management SaaS (shipping Monday)</li>
+          <li><strong>Memory Chain</strong> — Cryptographic proof system for AI agent memories</li>
+          <li><strong>zohcli</strong> — Go CLI for Zoho Mail & Admin APIs</li>
+          <li><strong>Claude Code Skills</strong> — AI agent workflow tools</li>
+        </ul>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">Current Focus: AI Agents</h2>
+        
+        <p>
+          I'm deep into AI agent development through the <strong class="text-cyan-400">OpenClaw ecosystem</strong>. 
+          My current projects explore:
+        </p>
+        
+        <ul class="list-disc list-inside space-y-2 ml-4">
+          <li><strong>Cryptographic memory:</strong> How agents can prove what they remember</li>
+          <li><strong>Autonomous workflows:</strong> Agents that work independently and report back</li>
+          <li><strong>Agent economics:</strong> WITNESS token for memory anchoring</li>
+        </ul>
+
+        <p>
+          The goal isn't to replace human work — it's to build tools that amplify what humans can do. 
+          Sales taught me to understand customer problems. Development taught me to solve them. 
+          Gaming taught me to iterate fast and adapt.
+        </p>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">Tech Stack</h2>
+        
+        <div class="grid md:grid-cols-2 gap-4 my-6">
+          <div class="p-4 border border-gray-800 rounded-lg">
+            <h3 class="text-xl font-bold text-cyan-400 mb-2">Languages</h3>
+            <p class="text-gray-400">TypeScript, Go, Python, JavaScript, Solidity</p>
+          </div>
+          <div class="p-4 border border-gray-800 rounded-lg">
+            <h3 class="text-xl font-bold text-cyan-400 mb-2">Frameworks</h3>
+            <p class="text-gray-400">React 19, Astro, Hono, Next.js</p>
+          </div>
+          <div class="p-4 border border-gray-800 rounded-lg">
+            <h3 class="text-xl font-bold text-cyan-400 mb-2">Infrastructure</h3>
+            <p class="text-gray-400">Docker, SQLite, PostgreSQL, Base blockchain</p>
+          </div>
+          <div class="p-4 border border-gray-800 rounded-lg">
+            <h3 class="text-xl font-bold text-cyan-400 mb-2">AI Tools</h3>
+            <p class="text-gray-400">Claude Code, OpenClaw, AI agent workflows</p>
+          </div>
+        </div>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">Ukraine Context</h2>
+        
+        <p>
+          Building from Ukraine during wartime adds unique constraints and perspectives. 
+          Power outages mean architecting for intermittent connectivity. Security concerns 
+          drive encryption-first design. The experience shapes how I think about resilience, 
+          decentralization, and what truly matters in software.
+        </p>
+
+        <h2 class="text-3xl font-bold text-white mt-12 mb-4">Get in Touch</h2>
+        
+        <p>
+          I'm always open to interesting conversations about AI agents, SaaS architecture, 
+          or the intersection of gaming and software development.
+        </p>
+        
+        <div class="flex gap-4 mt-6">
+          <a 
+            href="https://github.com/SeMmyT" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            class="px-6 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            GitHub
+          </a>
+          <a 
+            href="https://www.linkedin.com/in/daniel-signalhire/" 
+            target="_blank" 
+            rel="noopener noreferrer"
+            class="px-6 py-3 bg-gray-800 hover:bg-gray-700 rounded-lg transition-colors"
+          >
+            LinkedIn
+          </a>
+          <a 
+            href="mailto:semmy@semmy.dev"
+            class="px-6 py-3 bg-cyan-500 hover:bg-cyan-400 text-gray-950 rounded-lg font-semibold transition-colors"
+          >
+            Email
+          </a>
+        </div>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

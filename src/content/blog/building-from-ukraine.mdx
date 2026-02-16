@@ -1,0 +1,209 @@
+---
+title: "Building Software During Wartime: Lessons from Ukraine"
+description: "How power outages, security concerns, and wartime constraints shaped my approach to software architecture."
+pubDate: 2026-02-15
+tags: ["ukraine", "architecture", "resilience"]
+---
+
+I build software from Kyiv, Ukraine. We're at war. That context shapes every technical decision I make.
+
+This isn't a political post. It's about how **constraints drive better architecture**.
+
+## The Power Situation
+
+Ukraine gets ~12 hours of electricity per day. Not consecutive. Not predictable.
+
+What that means for development:
+- **No always-on local hardware** — Everything runs on VPS (Hetzner)
+- **Manual generator management** — Charging station requires intervention
+- **Intermittent connectivity** — Architecture must handle disconnects gracefully
+
+**Lesson**: If your system breaks during a 4-hour power outage, you designed it wrong.
+
+### Technical Adaptations
+
+**1. VPS-First Architecture**
+My main PC (AMD 7800X3D, RTX 4070Ti) can't be always-on. So:
+- OpenClaw gateway: Hetzner VPS (24/7)
+- Databases: SQLite on VPS (not local PostgreSQL)
+- Services: Docker containers on VPS
+
+**2. State Management**
+Every service assumes it might disappear mid-operation:
+- Write-ahead logging for critical state
+- Idempotent operations (safe to retry)
+- No in-memory-only state
+
+**3. Graceful Degradation**
+Example: My AI agent (Klowalski) runs on VPS. When my PC loses power:
+- Agent continues autonomous work
+- Results saved to shared workspace
+- I catch up when power returns
+
+No data loss. No confused state. Just resilience.
+
+## Security Mindset
+
+Russian intelligence agencies have demonstrated capability and intent to compromise Ukrainian infrastructure. That's not paranoia — it's threat modeling.
+
+### Encryption-First Design
+
+Every project starts with:
+- **TLS everywhere** — Even internal services
+- **At-rest encryption** — Sensitive data encrypted on disk
+- **End-to-end where possible** — Trust no intermediary
+
+Example: Memory Chain supports AES-256-GCM for sensitive memories. Even if someone gets the chain file, they can't read encrypted entries without keys.
+
+### Zero-Trust Networking
+
+- **Tailscale for SSH** — No public SSH ports (removed on Feb 15)
+- **VPN-only admin panels** — Mattermost, Fizzy, etc. not public
+- **Hardware tokens** — YubiKey for critical auth (migration planned)
+
+**Lesson**: If you're in a hostile environment, assume every connection is monitored. Design accordingly.
+
+## Intermittent Connectivity
+
+Internet in Ukraine is reliable... until it isn't. Russian attacks target telecom infrastructure.
+
+### Offline-First Patterns
+
+**1. Local-First Storage**
+- SQLite databases (work offline, sync later)
+- Git for code (commit locally, push when connected)
+- Append-only logs (never lose data)
+
+**2. Queue-Based Communication**
+Instead of:
+```javascript
+await sendEmail(); // Fails if offline
+```
+
+Do:
+```javascript
+await emailQueue.add(message); // Always succeeds
+// Worker processes queue when connected
+```
+
+**3. Conflict-Free Data**
+Design data structures that merge cleanly:
+- CRDTs where appropriate
+- Timestamp-based conflict resolution
+- Append-only chains (Memory Chain does this)
+
+### Real Example: Govantazh
+
+Cargo management SaaS built for Ukraine logistics:
+- **Multi-tenant SQLite** — Each tenant's data is a file
+- **Email ingestion queue** — Gmail parser doesn't fail on network blips
+- **Offline dashboard** — React 19 with aggressive caching
+
+Works when internet is sketchy. Still ships Monday.
+
+## Time Management
+
+War means unpredictable interruptions:
+- Air raid sirens
+- Power schedule changes
+- Mental load
+
+### Adaptation: Micro-Commits
+
+I commit code in small chunks:
+```bash
+git commit -m "feat: add user auth"        # ❌ Too big
+git commit -m "feat: add login form UI"    # ✅ Shippable
+git commit -m "feat: add auth API route"   # ✅ Shippable
+git commit -m "feat: connect login to API" # ✅ Shippable
+```
+
+Why? If an air raid interrupts work at 2am, I want shippable state at every commit. Not half-finished features that don't compile.
+
+**Palmer Principle** (from my AGENTS.md):
+> "Always leave a session in a state where future-you understands what happened."
+
+Same logic. Future-you might be dealing with an air raid. Make their life easier.
+
+## Optimizing for Low Resources
+
+VPS specs: Hetzner CAX21 (8GB RAM, 4 vCPU ARM64)
+
+Running:
+- OpenClaw gateway (~940MB)
+- Mattermost (~120MB)
+- Matrix homeserver (~90MB)
+- Fizzy Kanban (~260MB)
+- Viatex production site (~160MB)
+- Traefik reverse proxy (~20MB)
+
+**Total: ~1.6GB of ~8GB used**
+
+How?
+1. **Alpine Linux containers** — Minimal base images
+2. **Aggressive caching** — Turbo, pnpm, Docker layers
+3. **Lazy loading** — Services start on-demand
+4. **Smart scheduling** — Cron jobs during low-usage hours
+
+**Lesson**: RAM constraints force elegant architecture. Bloat is a choice.
+
+## What Ukraine Taught Me
+
+**1. Resilience > Features**
+A feature that breaks under stress is worse than no feature. Design for hostile conditions.
+
+**2. Offline-First Wins**
+Even in peace, networks fail. Power goes out. Laptops disconnect. Offline-first patterns aren't "Ukraine-specific" — they're just good engineering.
+
+**3. Constraints Breed Creativity**
+No always-on hardware? Use VPS. No reliable internet? Queue everything. Limited RAM? Optimize ruthlessly.
+
+**4. Security Isn't Optional**
+In peacetime, security is "best practice." In wartime, it's survival. But the techniques (encryption, zero-trust, hardware tokens) work everywhere.
+
+**5. Ship Small, Ship Often**
+You never know when the next interruption comes. Keep work in shippable state. Micro-commits. Continuous deployment.
+
+## Tools I Rely On
+
+- **VPS**: Hetzner (Germany) — Reliable, ARM64, cheap
+- **VPN**: Tailscale — Zero-config mesh networking
+- **Backup**: Restic + Backblaze — Encrypted off-site backups
+- **Comms**: Matrix — Self-hosted, E2E encrypted
+- **Auth**: YubiKey (planned) — Hardware 2FA
+- **Monitoring**: UptimeRobot — Know when services go down
+
+All chosen for **resilience under adversity**.
+
+## For Developers in Stable Environments
+
+You probably have:
+- 24/7 electricity
+- Gigabit internet
+- No air raids
+
+Lucky you. But don't let comfort make you lazy.
+
+Ask yourself:
+- What happens if AWS has a 6-hour outage?
+- What if your database gets compromised?
+- Can your users work offline?
+
+**Build like Ukraine forced me to build**: resilient, encrypted, offline-capable, shippable at every commit.
+
+Not because war is coming to you. Because that's just better software.
+
+---
+
+**Currently shipping from Kyiv:**
+- Govantazh (cargo SaaS) — Monday deploy
+- Memory Chain (AI agent memory) — Live on Base
+- semmy.dev (this site) — Built by my AI agent overnight
+
+All built with 12h/day electricity. All deployed to Hetzner VPS. All designed for hostile conditions.
+
+**Slava Ukraini** 🇺🇦
+
+---
+
+*If you're building software in difficult circumstances (war, unstable infrastructure, resource constraints), I'd love to hear about your adaptations. Find me on [GitHub](https://github.com/SeMmyT) or [LinkedIn](https://www.linkedin.com/in/daniel-signalhire/).*
