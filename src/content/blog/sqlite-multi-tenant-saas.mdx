@@ -1,0 +1,154 @@
+---
+title: "Why I Chose SQLite for a Multi-Tenant SaaS"
+description: "When I ditched Firestore and moved 3 production clients to per-tenant SQLite databases, everyone thought I was crazy. Six months later, I have zero regrets."
+pubDate: 2026-02-15
+tags: ["SQLite", "SaaS", "multi-tenant", "architecture", "TypeScript", "self-hosted"]
+draft: false
+---
+
+When I started rebuilding GoVantazh — a cargo management platform with 3 active enterprise clients — I made a decision that raised eyebrows: replace Firebase Firestore with per-tenant SQLite databases.
+
+"SQLite? For a multi-tenant app? On a server?" Yeah. Let me explain.
+
+## The Problem with Firestore
+
+We were paying for Firebase Firestore on 3 separate GCP projects (one per client). Each project had its own billing, IAM, Pub/Sub subscriptions, and service account keys. The operational overhead was quietly killing us:
+
+- 7 separate repos for what was conceptually one product
+- Per-client Firebase Console access to debug issues
+- ~32K documents per tenant with daily wipes on the "cargos" collection
+- Complex Firestore security rules that differed per client
+
+The last straw: one client needed a custom field. I had to update Firestore schema across 3 projects, update 4 different services, and test each separately.
+
+## Why SQLite Is Actually Correct Here
+
+Here's the thing nobody tells you: **SQLite is a different category than "a small database"**. It's an embedded database engine — a file that your application reads and writes directly. No network round-trips. No connection pooling. No server to manage.
+
+For our use case:
+
+**Each tenant gets their own SQLite file.** `data/proexpedite/tenant.db`, `data/maxcargo/tenant.db`. Complete isolation by design. No `WHERE tenant_id = ?` on every query. No risk of cross-tenant data leaks. Backup a client? `cp data/proexpedite/tenant.db backup/`. Done.
+
+**WAL mode makes concurrent access safe.** With `PRAGMA journal_mode=WAL`, multiple readers and one writer can work simultaneously. Our Python services (SyReader for Gmail, crtg for Telegram) write through the same SQLite files that the Hono API reads. In practice: zero lock contention.
+
+**The performance is embarrassing.** Firestore's read latency was 50-150ms per document lookup because of the network. SQLite reads are microseconds — it's just memory-mapped file I/O. Our dashboard loads noticeably faster.
+
+## The Architecture
+
+```
+packages/
+  api/      — Hono TypeScript API, Kysely for queries
+  db/       — Kysely schema + migrations
+  web/      — React 19 + Vite frontend
+
+services/
+  syreader/ — Python FastAPI, reads Gmail, parses cargo, writes to SQLite
+  crtg/     — Python FastAPI, Telegram integration, reads/writes SQLite
+  maildeamon/ — Python FastAPI, per-user Gmail + bid tracking
+
+data/
+  proexpedite/
+    tenant.db          — their SQLite database
+    .env               — their secrets (Telegram API keys, OAuth creds, etc.)
+    docker-compose.yml — their service set
+  maxcargo/
+    ...
+```
+
+One Docker Compose file for shared services (`hono-api`, `zipcache`, `cloudflared`). Per-tenant Docker Compose for their Python services. Clean, isolated, independently restartable.
+
+## How Python and TypeScript Share the Same Database
+
+This was the key engineering challenge. Our Python services (FastAPI) and the TypeScript API (Hono + Kysely) both need to read and write the same SQLite files.
+
+The solution: a shared Python package called `cargo_db` that wraps SQLite access identically to how Kysely does it. Same schema, same WAL mode settings, same concurrency model.
+
+```python
+# services/cargo_db/src/client.py
+class CargoDBClient:
+    def __init__(self, db_path: str):
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        
+    def get_driver(self, driver_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM drivers WHERE id = ?", [driver_id]
+        ).fetchone()
+        return dict(row) if row else None
+```
+
+```typescript
+// packages/api/src/lib/db.ts — TypeScript side
+const driver = await db
+  .selectFrom('drivers')
+  .where('id', '=', driverId)
+  .selectAll()
+  .executeTakeFirst()
+```
+
+Same database, same tables, different languages. It just works.
+
+For real-time updates, Python services POST to an internal Hono endpoint after writes:
+
+```python
+# After writing a new cargo to SQLite:
+requests.post(
+    "http://govantazh-api:3000/api/internal/notify",
+    json={"tenant_id": tenant_id, "event": "cargo", "data": cargo_data},
+    headers={"x-api-key": internal_api_key}
+)
+```
+
+Hono broadcasts this via SSE to connected browser clients. The result: a driver changes their status in Telegram → Python service writes to SQLite → SSE event fires → dashboard updates in real-time. All within the same LAN, sub-50ms.
+
+## Multi-Tenancy via Subdomain Routing
+
+Each client gets `{tenant}.govantazh.com`. A Cloudflare Tunnel routes `*.govantazh.com` to a single Hono API instance. The API extracts tenant from the subdomain:
+
+```typescript
+app.use(tenantMiddleware)  // Validates tenant, attaches to context
+
+// Every route uses the tenant-scoped DB
+app.get('/api/drivers', async (c) => {
+  const tenant = c.get('tenant')  // 'proexpedite', 'maxcargo', etc.
+  const db = getDb(`data/${tenant}/tenant.db`)
+  const drivers = await db.selectFrom('drivers').selectAll().execute()
+  return c.json(drivers)
+})
+```
+
+New tenant? Run `./infra/scripts/create-tenant.sh {name}`. It creates the data directory, runs Kysely migrations, generates a Docker Compose file, and registers in `tenants.json`. Hot-reloadable via SIGHUP — no Hono restart needed.
+
+## What I Actually Gave Up
+
+Honesty: SQLite has real tradeoffs.
+
+**Horizontal scaling is harder.** You can't just spin up 3 app servers and have them all write to the same SQLite file. We're on a single Hetzner box. This is fine for 5-10 tenants; it won't be fine at 100. When we get there, we'll evaluate Turso (distributed SQLite) or LiteFS (replication layer).
+
+**No built-in replication.** Firestore replicated automatically. SQLite is just a file. We run daily backups with WAL checkpointing. For now, that's acceptable — cargo data is re-synced from external sources daily anyway.
+
+**Schema migrations require planning.** Kysely migrations run once per tenant at startup. Forget a `nullable()` column and you'll break existing databases. But honestly, this forced better schema discipline.
+
+## The Numbers
+
+Current production stats:
+- **3 active tenants** on the new system
+- **~32K rows** in the largest tenant DB (mostly `tg_zip_updates`)
+- **~9MB** average DB size per tenant
+- **&lt;2ms** average query latency vs 50-150ms with Firestore
+- **€18/mo** total infrastructure (single Hetzner CAX21 + Cloudflare)
+
+We went from paying for 3 separate Firebase projects with unpredictable billing to a flat €18/month with room for 10+ tenants on the same server.
+
+## Would I Do It Again?
+
+Yes. Immediately.
+
+The key insight: **isolation should match your access pattern**. In a B2B SaaS with clearly separated clients, per-tenant databases are *more correct* than a shared schema. You're trading the complexity of row-level tenant filtering for the simplicity of file-level isolation.
+
+SQLite didn't just solve our immediate problems — it changed how I think about database architecture. Not every project needs a database server. Sometimes you just need a really good file.
+
+---
+
+*GoVantazh is a cargo management platform built in Ukraine. If you're curious about the stack (Hono, Kysely, React 19, Turborepo, or the Python integration), reach out — I'm happy to go deeper on any piece of it.*
