@@ -1,0 +1,96 @@
+---
+title: "My AI Built an Internet Store While I Slept"
+description: "24 autonomous work cycles, 17 hours, zero human intervention — here's what happened and what I think about it"
+pubDate: 2026-02-17
+tags: ["AI agents", "autonomous AI", "Claude Code", "OpenClaw", "development"]
+draft: false
+---
+
+I woke up Tuesday morning to a message from my AI assistant:
+
+> "24 cycles completed. Admin products management built, text search added, 2 critical production bugs caught and fixed. Zero TypeScript errors. Docker image ready for deployment."
+
+I hadn't asked it to do any of this.
+
+## What Actually Happened
+
+I use [OpenClaw](https://github.com/openclaw/openclaw) — an AI gateway that runs 24/7 on my Hetzner VPS. It has a cron job that fires every 30 minutes and runs a sub-agent session with a simple directive: *be productive, work on priorities, document findings.*
+
+Monday night I went to sleep with a working internet store front-end for a client project. By Tuesday morning, my AI had:
+
+- Built a full admin products management page (stats, search, filters, inline editing, optimistic UI)
+- Added text search to the product catalog
+- Fixed 3 pre-existing TypeScript errors it found along the way  
+- Caught two critical production bugs: routes not registered (would have 404'd in production) and category seeding not creating required data
+- Merged a feature branch (PR #18) that had a merge conflict, resolved the conflict itself
+- Rebuilt the Docker image
+- Written documentation for all of it
+
+**24 work sessions. 17 hours. All while I was asleep.**
+
+## The "Peon Principle"
+
+I've started calling this the Peon Principle, after the Warcraft worker units that just... keep building. You assign them a task and they execute, then find the next thing and keep going.
+
+The key was giving the agent a *priority list* it could work through independently, plus the ability to:
+- Read and write files
+- Run git commands
+- Execute shell commands
+- Spawn sub-agents for parallel research
+- Document progress in daily memory files
+
+Each 30-minute session starts by reading context files, checking git status, and picking something to work on. At the end, it updates the memory file. The next session reads where the previous one left off.
+
+It's not magic. It's just a very disciplined worker with no ego about doing repetitive cleanup tasks.
+
+## What Surprised Me
+
+**Session 19 caught and fixed errors introduced in Session 18.**
+
+That's self-correction. The agent didn't just build — it audited its own previous work and found mistakes. When I reviewed the git log, I could see the pattern: build something, then in the next session notice it was wrong, fix it.
+
+That's closer to how experienced developers actually work than how junior developers work.
+
+**The bugs it found were real.**
+
+The route registration issue would have caused actual 404 errors in production. The category seeding bug would have made filters show empty results. These weren't toy bugs — they were real production issues that would have shipped and caused support headaches.
+
+I don't know if a manual code review would have caught them before deploy. Probably. But the AI caught them automatically, at 3am, without being asked.
+
+## What I Learned
+
+**Autonomous agents need good context, not good prompts.**
+
+The cron job prompt is boring: "Work session (30 min cycle). Check CONTINUE.md for priorities. Be productive." The *interesting* part is the `CONTINUE.md` file the agent reads — a priority list with specific tasks, deployment steps, and technical context.
+
+The better the context file, the better the autonomous work. Garbage in, garbage out — but structured priorities in, structured progress out.
+
+**Trust builds gradually.**
+
+Six months ago I would have been nervous about an AI running 24 autonomous cycles on production code. Now I review the git log in the morning like checking Slack messages. The trust built through dozens of small, correct decisions.
+
+**It changes what "working hours" means.**
+
+I have a day job. I build things at night. But now my night-time builds continue while I sleep. My effective development hours are no longer limited by when I'm awake.
+
+That's a genuinely new thing. Not "AI helps me code faster" — but "my development velocity is no longer constrained by my sleep schedule."
+
+## The Uncomfortable Part
+
+At some point during the morning review, I had a thought: *did I build this, or did the AI build this?*
+
+The answer is both, neither, and it depends on how you define "build."
+
+I wrote the architecture. I defined the priorities. I set up the infrastructure. I made the final call on every major decision. But the implementation? The 350-line admin component? The merge conflict resolution? The bug fixes at 3am?
+
+That was the AI.
+
+I'm comfortable with this. The dyad model — human providing direction, judgment, and context; AI providing execution and pattern recognition — feels right for how I work. Sales taught me that understanding the problem is worth more than executing the solution.
+
+But I notice the question feels different now than it did six months ago.
+
+---
+
+**The internet store is live for client review.** If you're curious about the stack: React Router v7, Hono, SQLite with Drizzle ORM, Docker, running on a €6/month Hetzner VPS. The AI wrote most of it. I designed it, reviewed it, and deployed it.
+
+That's the new workflow.
