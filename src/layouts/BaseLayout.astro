@@ -7,17 +7,17 @@ interface Props {
 }
 
 const { 
-  title = 'Daniel Petrushevsky (SeMmy) — Day sales, night tools builder',
-  description = 'Personal website of Daniel Petrushevsky (SeMmy) — software developer, AI tools builder, ex-Dota player from Oleksandriya, Ukraine.'
+  title = 'Daniel Petrushevsky — AI tools builder from Ukraine',
+  description = 'Building AI agent tools and SaaS platforms. Cryptographic memory systems, autonomous workflows, and more.'
 } = Astro.props;
 ---
 
 <!doctype html>
-<html lang="en" class="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="description" content={description} />
-    <meta name="viewport" content="width=device-width" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="generator" content={Astro.generator} />
     <title>{title}</title>
@@ -36,38 +36,52 @@ const {
     <!-- RSS Feed -->
     <link rel="alternate" type="application/rss+xml" title="SeMmy Blog" href="/rss.xml" />
   </head>
-  <body class="bg-gray-950 text-gray-100 min-h-screen">
-    <nav class="border-b border-gray-800">
-      <div class="max-w-6xl mx-auto px-6 py-4">
-        <div class="flex justify-between items-center">
-          <a href="/" class="text-xl font-bold hover:text-cyan-400 transition-colors">
-            SeMmy
+  <body style="background:#080810; color:#e2e8f0; min-height:100vh;">
+    <!-- Background effects -->
+    <div class="mesh-bg"></div>
+    <div class="grid-overlay"></div>
+    
+    <!-- Nav -->
+    <nav class="nav-blur fixed top-0 left-0 right-0 z-50">
+      <div style="max-width:1100px; margin:0 auto; padding:0 24px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; height:60px;">
+          <a href="/" style="font-weight:700; font-size:1.1rem; letter-spacing:-0.02em; color:white; text-decoration:none;">
+            SeMmy<span style="color:#22d3ee;">.</span>dev
           </a>
-          <div class="flex gap-6">
-            <a href="/#projects" class="hover:text-cyan-400 transition-colors">Projects</a>
-            <a href="/blog" class="hover:text-cyan-400 transition-colors">Blog</a>
-            <a href="/about" class="hover:text-cyan-400 transition-colors">About</a>
+          <div style="display:flex; gap:32px; align-items:center;">
+            <a href="/#projects" style="color:#94a3b8; font-size:0.9rem; text-decoration:none; transition:color 0.2s;" 
+               onmouseover="this.style.color='#22d3ee'" onmouseout="this.style.color='#94a3b8'">projects</a>
+            <a href="/blog" style="color:#94a3b8; font-size:0.9rem; text-decoration:none; transition:color 0.2s;"
+               onmouseover="this.style.color='#22d3ee'" onmouseout="this.style.color='#94a3b8'">blog</a>
+            <a href="/about" style="color:#94a3b8; font-size:0.9rem; text-decoration:none; transition:color 0.2s;"
+               onmouseover="this.style.color='#22d3ee'" onmouseout="this.style.color='#94a3b8'">about</a>
+            <a href="https://github.com/SeMmyT" target="_blank" rel="noopener"
+               style="display:flex; align-items:center; gap:6px; font-size:0.85rem; color:#94a3b8; text-decoration:none; border:1px solid rgba(255,255,255,0.1); border-radius:8px; padding:6px 14px; transition:all 0.2s;"
+               onmouseover="this.style.borderColor='rgba(34,211,238,0.4)'; this.style.color='#22d3ee';" 
+               onmouseout="this.style.borderColor='rgba(255,255,255,0.1)'; this.style.color='#94a3b8';">
+              GitHub →
+            </a>
           </div>
         </div>
       </div>
     </nav>
     
-    <main>
+    <!-- Main content -->
+    <main style="position:relative; z-index:1; padding-top:60px;">
       <slot />
     </main>
     
-    <footer class="border-t border-gray-800 mt-20">
-      <div class="max-w-6xl mx-auto px-6 py-8">
-        <div class="flex justify-between items-center text-gray-400 text-sm">
-          <p>© 2026 Daniel Petrushevsky</p>
-          <div class="flex gap-4">
-            <a href="https://github.com/SeMmyT" target="_blank" rel="noopener noreferrer" class="hover:text-cyan-400 transition-colors">
-              GitHub
-            </a>
-            <a href="https://www.linkedin.com/in/daniel-signalhire/" target="_blank" rel="noopener noreferrer" class="hover:text-cyan-400 transition-colors">
-              LinkedIn
-            </a>
-          </div>
+    <!-- Footer -->
+    <footer style="position:relative; z-index:1; margin-top:80px; padding:40px 24px; border-top:1px solid rgba(255,255,255,0.06);">
+      <div style="max-width:1100px; margin:0 auto; display:flex; justify-content:space-between; align-items:center; color:#475569; font-size:0.85rem;">
+        <span>© 2026 Daniel Petrushevsky</span>
+        <div style="display:flex; gap:24px;">
+          <a href="https://github.com/SeMmyT" target="_blank" rel="noopener" 
+             style="color:#475569; text-decoration:none; transition:color 0.2s;"
+             onmouseover="this.style.color='#22d3ee'" onmouseout="this.style.color='#475569'">GitHub</a>
+          <a href="https://www.linkedin.com/in/daniel-signalhire/" target="_blank" rel="noopener"
+             style="color:#475569; text-decoration:none; transition:color 0.2s;"
+             onmouseover="this.style.color='#22d3ee'" onmouseout="this.style.color='#475569'">LinkedIn</a>
         </div>
       </div>
     </footer>
