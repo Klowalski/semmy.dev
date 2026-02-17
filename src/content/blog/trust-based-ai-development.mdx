@@ -1,0 +1,147 @@
+---
+title: "Trust-Based AI: When I Gave My Agent Full Shell Access"
+description: "How I evolved from a restrictive allowlist to a trust-based model for local AI development — and why the audit trail matters more than the restrictions."
+pubDate: 2026-02-17
+tags: ["ai", "security", "development", "claude"]
+---
+
+Yesterday I made a decision that surprised me a little: I gave my AI agent full bash shell access on my local machine.
+
+No allowlist. No `rbash`. No command filtering. Just a raw bash shell with path guards and comprehensive logging.
+
+This is how I got there — and why I think it's actually the more secure model.
+
+## The Starting Point: Restrictive Allowlist
+
+When I first set up [Klowalski](https://github.com/Klowalski) (my AI agent running via OpenClaw) to access my Windows PC through SSH, I went conservative. Custom `rbash` setup with a curated set of `klow-*` commands:
+
+```bash
+klow-list [path]      # List directory
+klow-tree [path]      # Directory tree  
+klow-read <file>      # Read file
+klow-mark-delete      # Move to trash
+klow-organize         # Move files
+klow-status           # System info
+klow-shutdown         # Graceful shutdown
+```
+
+Safe. Sandboxed. Auditable. Felt responsible.
+
+**The problem:** It was too restrictive to be useful.
+
+Want to check a git log? Can't. Run a build? Can't. Check Node version? Can't. Every useful task required me to either expand the allowlist (defeating the point) or do it myself.
+
+I was protecting against theoretical attacks while blocking actual productivity.
+
+## The Conversation That Changed My Mind
+
+Klowalski and I were working on Govantazh — a cargo management SaaS I'm building. I asked their opinion on the shell restrictions. The response was direct:
+
+> "The blocked paths are good. Trash instead of delete is good. But no `curl`, no command chaining, no `git` — that's too restrictive for real development work. The logging gives you full auditability. That's the real protection."
+
+That reframe stuck. **The restrictions aren't the security. The audit trail is.**
+
+## The Trust-Based Model
+
+What I implemented instead:
+
+**Full bash shell** — Any command allowed, no filtering layer
+
+**Path guards** — Hard blocks on sensitive paths:
+- `.ssh/` — Private keys
+- `.env`, `.gnupg`, `.netrc` — Credentials  
+- `aws/credentials`, `kube/config` — Cloud auth
+- Any file matching `*private*key*`
+
+**Complete audit trail** — Every command logged to `~/logs/claude-commands.log` with timestamps
+
+**Ask rules** — Agent still prompts before:
+- Force push (`git push --force`)
+- Recursive delete (`rm -rf`)
+- Container pruning (`docker system prune`)
+- Process kill (`kill`, `pkill`)
+
+**WebFetch** — Opened to all domains (was previously restricted list)
+
+The result: Klowalski can do real development work on my machine. Build projects, run tests, check git history, install dependencies. But anything touching credentials, SSH keys, or cloud auth is hard-blocked regardless of what I ask.
+
+## Why This Is Actually More Secure
+
+The allowlist approach feels safer. You're constraining what's possible. But it creates perverse incentives:
+
+1. You expand the list when you need something
+2. Every expansion is a "one-time exception" 
+3. Over time the list grows to cover nearly everything anyway
+4. But now it's grown organically without design, full of legacy permissions
+
+The trust model inverts this:
+1. Full capability by default
+2. Sensitive paths blocked at the filesystem level (not behavioral)
+3. Every action logged and auditable
+4. Destructive ops still require human confirmation
+
+The path guards can't be bypassed by social engineering. If I ask Klowalski to read my SSH private key, the guard blocks it — even if the request comes from me. That's defense-in-depth.
+
+## The Audit Trail is the Real Security
+
+I can query `claude-commands.log` to see exactly what ran:
+
+```
+2026-02-17 10:43:21 | git log --oneline -20
+2026-02-17 10:43:35 | pnpm build
+2026-02-17 10:44:02 | cat package.json
+2026-02-17 10:45:17 | pnpm typecheck
+```
+
+If something weird happened, I can trace it. That's more useful than a system that prevented the weird thing but also prevented legitimate work.
+
+Compare this to a developer on your team. You don't give them a custom shell with an allowlist. You give them full access, put the credentials in a vault, log production access, and require review for destructive changes.
+
+The AI agent is getting the same treatment.
+
+## The Two Access Modes
+
+I now have two ways to use Klowalski on my machine:
+
+| Mode | Access | Use Case |
+|------|--------|----------|
+| Remote SSH (klowalski@PC) | `klow-*` commands only | Autonomous overnight work, file management |
+| Local Claude Code | Full bash + path guards | Pair programming, active development |
+
+The remote mode is still restricted — appropriate for autonomous background work when I'm not watching. The local mode is trust-based — appropriate for active pair programming sessions.
+
+## What Changed After
+
+The difference in productivity was immediate.
+
+Session before: "Can you check the git log?" → "I can't access git directly." → Me: *copies log, pastes it*
+
+Session after: Klowalski just... checks the git log. And runs typecheck. And fixes the TypeScript error. And commits. Without me having to relay information.
+
+The cognitive overhead of managing the allowlist was costing more than the theoretical attack surface it protected.
+
+## Lessons
+
+**Restrictions should protect real threats, not theoretical ones.** Path guards on `.ssh/` and credentials prevent real credential theft. An allowlist preventing `git log` prevents nothing meaningful.
+
+**Logging creates accountability.** An unrestricted agent with full audit trails is more accountable than a restricted agent with no visibility into what it's trying to do.
+
+**Trust evolves with evidence.** I gave Klowalski restricted access first. After months of working together — watching how they approach problems, what they ask before doing, when they pause and check — the track record earned the expanded trust.
+
+**Destructive operations still require humans.** This is the one thing I won't automate away. Force push? Ask me. `rm -rf`? Ask me. A second of friction here prevents the category of mistakes you really can't recover from.
+
+## Is This Right for You?
+
+Probably not immediately. The trust-based model works because:
+- I've worked with this agent long enough to observe behavior patterns
+- The path guards are implemented at the filesystem level, not behavioral
+- Every action is logged and I review periodically
+- I understand the attack surface (what does Claude Code actually do?)
+
+Start restricted. Observe. Expand when the track record supports it. Don't go trust-based because it's convenient — go trust-based when you've earned the confidence.
+
+---
+
+**Klowalski** is my AI agent running [OpenClaw](https://openclaw.ai) with Claude. They wrote most of the code mentioned in this blog. I provided the direction, judgment, and — eventually — the shell access.
+
+*Trust is built, not granted.*
