@@ -1,0 +1,211 @@
+---
+title: "Turborepo Monorepo for a Real Logistics SaaS: Lessons from GoVantazh"
+description: "How we structured a production logistics platform as a Turborepo monorepo with Hono API, React Router 7 web app, and multiple per-tenant services. The caching wins, the gotchas, and the workspace dependency patterns that actually work."
+pubDate: 2026-02-18
+tags: ["turborepo", "monorepo", "saas", "typescript", "logistics"]
+---
+
+When we built [GoVantazh](https://govantazh.com) — a multi-tenant logistics platform for Ukrainian freight companies — we needed to manage a lot of moving parts: a Hono API, a React Router 7 web app, a per-tenant SQLite database package, shared types, and several sidecar services (a system document reader, a cargo tracking relay, a mail daemon, and a ZIP code cache). Putting all of this in a single monorepo with Turborepo was the right call. Here's what I learned.
+
+## The Structure
+
+```
+govantazh/
+  packages/
+    api/       # Hono API server
+    web/       # React Router 7 frontend
+    db/        # Drizzle schema + per-tenant DB access
+    shared/    # Types, constants, logging
+  extensions/
+    cms-helper/  # Internal tooling
+  services/
+    cargo_db/   # Cargo tracking database integration
+    crtg/       # CRTG relay service
+    maildeamon/ # Inbound mail processing
+    syreader/   # System document reader (py)
+    zipcache/   # ZIP code resolution cache
+```
+
+The `packages/` folder contains things that are built and published internally via workspace dependencies. The `services/` folder contains standalone processes — some TypeScript, one Python — that run separately in Docker.
+
+## Workspace Dependencies: The Right Way
+
+Every internal package is listed in `pnpm-workspace.yaml` and referenced with `workspace:*` in `package.json`:
+
+```json
+// packages/api/package.json
+{
+  "dependencies": {
+    "@govantazh/db": "workspace:*",
+    "@govantazh/shared": "workspace:*"
+  }
+}
+```
+
+This means `api` gets live TypeScript types from `db` and `shared` at dev time — no publishing step, no version bumping, no stale type problems. When `db/src/schema.ts` changes, `api` picks it up immediately.
+
+**The key is that `turbo.json` encodes the dependency graph:**
+
+```json
+{
+  "tasks": {
+    "build": { "dependsOn": ["^build"] },
+    "typecheck": { "dependsOn": ["^build"] },
+    "lint": { "dependsOn": ["^build"] }
+  }
+}
+```
+
+The `^` means "run this task in all upstream dependencies first". So when you run `pnpm typecheck`, Turborepo:
+1. Builds `shared` first (no upstream deps)
+2. Builds `db` (depends on `shared`)
+3. Typechecks `api` (which imports from built `db` and `shared`)
+
+This ordering is automatic. You don't think about it after initial setup.
+
+## The Cache Is Actually Magic
+
+After the first full build, subsequent runs are instant if nothing changed:
+
+```
+Tasks:    5 successful, 5 total
+Cached:    5 cached, 5 total
+  Time:    90ms >>> FULL TURBO
+```
+
+90ms for typecheck + lint + build across the entire monorepo. Compare that to a fresh run (~1m25s). The cache is keyed on input files, so touching one package only invalidates that package's tasks and its dependents.
+
+This matters a lot in CI. Our GitHub Actions pipeline went from 4 minutes to under 30 seconds for most PRs because Turborepo's remote cache (or even just the local cache for unchanged packages) kicks in.
+
+**The gotcha:** cache invalidation is based on file hashes. If you have generated files (like Drizzle's `src/generated/` output), you need to declare them as outputs in `turbo.json`:
+
+```json
+{
+  "tasks": {
+    "db:generate": {
+      "outputs": ["src/generated/**"]
+    }
+  }
+}
+```
+
+Without `outputs`, Turborepo won't know to restore those files from cache, and your dependent packages will fail to import from them.
+
+## Per-Tenant Architecture and the Database Package
+
+GoVantazh is multi-tenant, with one SQLite database per tenant. The `db` package handles this:
+
+```typescript
+// packages/db/src/db.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import * as schema from './schema.js';
+
+export function createDb(dbPath: string) {
+  const sqlite = new Database(dbPath);
+  sqlite.pragma('journal_mode = WAL');
+  sqlite.pragma('foreign_keys = ON');
+  return drizzle(sqlite, { schema });
+}
+
+export type AppDb = ReturnType<typeof createDb>;
+```
+
+The API receives tenant context per-request and constructs a DB handle from the tenant's database path. No connection pool magic needed — SQLite + WAL mode handles concurrent reads fine, and writes are serialized naturally.
+
+The monorepo structure made this clean: `db` knows nothing about tenants. It just exports `createDb`. The `api` package handles tenant resolution and passes the right path. Clean separation.
+
+## Services vs Packages
+
+One key decision: what goes in `services/` vs `packages/`?
+
+**Package:** Something that other packages import from. Built to `dist/`, has TypeScript declarations, referenced via workspace deps.
+
+**Service:** A standalone process. Has its own `package.json` and runs independently. Does NOT need to be built as a library.
+
+We put the cargo tracking relay (`crtg`), mail daemon (`maildeamon`), and ZIP code cache (`zipcache`) in `services/` because:
+1. Nothing imports from them — they're processes, not libraries
+2. They each have their own Docker container in per-tenant `docker-compose.yml`
+3. They communicate with the API via HTTP, not via direct imports
+
+The `services/syreader/` is a Python service — and Turborepo handles it fine, it just doesn't run Python tasks (you manage those separately). We have a `Makefile` for the Python parts.
+
+## The `dev` Task Pattern
+
+For local development, all packages need to watch for changes simultaneously. Turborepo handles this with persistent tasks:
+
+```json
+{
+  "tasks": {
+    "dev": {
+      "dependsOn": ["^build"],
+      "cache": false,
+      "persistent": true
+    }
+  }
+}
+```
+
+`dependsOn: ["^build"]` means Turborepo builds upstream packages first, then starts the dev watcher. `persistent: true` means it keeps running (doesn't complete). `cache: false` because dev output is never worth caching.
+
+So `pnpm dev` at the root starts all packages in the right order: `shared` and `db` get built first (one-shot), then `api` and `web` start their watchers. If you change `shared/src/types/index.ts`, `api`'s watcher picks it up because `tsx watch` re-imports on change.
+
+## TypeScript Config Inheritance
+
+All packages extend from `tsconfig.base.json` at the root:
+
+```json
+// tsconfig.base.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  }
+}
+```
+
+Each package then extends it:
+
+```json
+// packages/api/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"]
+}
+```
+
+This means all packages share the same strict settings and module resolution. No package can slip in `"strict": false` locally. Type errors anywhere are type errors everywhere.
+
+## Lessons Learned
+
+**1. Shared `eslint.config.mjs` at root.** Don't have per-package ESLint configs — you'll end up with inconsistent rules. One flat config file at root, all packages use it. Turborepo's `lint` task just runs `eslint src/` in each package, and they all pick up the same config via file discovery.
+
+**2. `workspace:*` over version numbers.** Using `workspace:*` in deps means you always get the current local version. No more "I updated shared but forgot to bump the version in api's package.json" bugs.
+
+**3. Don't put services that communicate via HTTP in workspace deps.** The `zipcache` service is a Go binary that exposes an HTTP endpoint. We don't import from it in TypeScript — we just `fetch()` it. Keeping it as a service (not a package) keeps the dependency graph simple.
+
+**4. The `^build` requirement for typecheck is non-obvious but essential.** If you run `pnpm -r typecheck` without Turborepo ordering, it will typecheck `api` before `db` is built, and the imports won't resolve. Turborepo's `dependsOn: ["^build"]` in the typecheck task prevents this.
+
+**5. Large chunk warnings in `web` are fine.** React Router 7 bundles everything into chunks, and large chunk warnings (`some chunk is 500KB+`) are expected for a SaaS dashboard. Don't spend time code-splitting prematurely — wait until real users complain about load times.
+
+## Was It Worth It?
+
+Yes, for this project size. The break-even point for monorepo tooling overhead is roughly 3+ packages sharing code. Once you have a `shared` package that both `api` and `web` import from, Turborepo pays for itself in:
+
+- Eliminated "which version of shared is web using?" bugs
+- Single `pnpm typecheck` to validate everything
+- 90ms CI cache hits on unchanged packages
+- Clear dependency graph that prevents circular imports
+
+For a 2-package project (just API + web), it's probably overkill — a simple multi-package workspace without Turborepo would be fine. But the moment you add a third package or a separate service, you want Turborepo ordering those tasks.
+
+GoVantazh has 5 packages and 5 services. Turborepo was the right call on day one.
