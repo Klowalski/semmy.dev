@@ -1,0 +1,206 @@
+---
+title: "Drizzle + SQLite in Production: What Nobody Tells You About Migrations"
+description: "drizzle-kit push --force is fine locally. In production it will ruin your day. Real notes from running SQLite-backed apps in Docker containers, with a migration strategy that actually works."
+pubDate: "2026-02-18"
+tags: ["drizzle", "sqlite", "migrations", "production", "devops"]
+---
+
+When I started using Drizzle ORM with SQLite, I did what most people do: looked at the docs, saw `drizzle-kit push`, and thought "great, one command to sync the schema." It works perfectly in development. It works great in CI. Then you ship to production and reality kicks in.
+
+Here's what I learned running SQLite-backed Remix/React Router apps in Docker containers — the hard way.
+
+## The `push` vs `migrate` Distinction
+
+Drizzle has two fundamentally different workflows:
+
+**`drizzle-kit push`** — reads your schema, diffs against the live database, and applies changes directly. No migration files generated. No history. Just "make the database look like this."
+
+**`drizzle-kit generate` + `drizzle.migrate()`** — generates versioned SQL files, then applies them in order. Creates a `__drizzle_migrations` table to track what's been applied.
+
+For local dev: `push` is perfect. Fast, stateless, no friction.  
+For production: `push` is dangerous.
+
+Here's why.
+
+## The Problem With `push --force` in Production
+
+When I was building the Viatex internet store (a Remix app with SQLite), I used `push --force` to apply each schema change locally. Three migrations in, I ran it on a database that had live data.
+
+`push --force` doesn't care about your data. When Drizzle needs to rename a column, it can't do it in SQLite (SQLite doesn't support `ALTER TABLE RENAME COLUMN` in older versions). So it does this:
+
+1. Creates a new table with the new schema
+2. Copies data over (best-effort)
+3. Drops the old table
+4. Renames the new one
+
+If your schema change involves a column that can't be auto-migrated — say, a column type change from `text` to `integer`, or a non-null constraint added without a default — you silently lose data or get a crash.
+
+In development: doesn't matter, you reseed.  
+In production: disaster.
+
+## What SQLite Actually Supports for ALTER TABLE
+
+SQLite's `ALTER TABLE` support is famously minimal. As of SQLite 3.25.0 (2018), you can:
+
+- `ADD COLUMN` (with restrictions: not `NOT NULL` without a default, not `UNIQUE`, not `PRIMARY KEY`)
+- `RENAME TABLE`
+- `RENAME COLUMN` (3.25.0+)
+
+That's it. No:
+- `DROP COLUMN` (until 3.35.0 / 2021)
+- `MODIFY COLUMN` type
+- `ADD CONSTRAINT`
+
+Drizzle handles these limitations by doing the create-copy-drop dance. That dance is what makes `push --force` risky.
+
+## The Safe Production Pattern
+
+Here's the pattern that actually works:
+
+### 1. Generate Migrations During Development
+
+```bash
+# After changing your schema file:
+pnpm drizzle-kit generate
+
+# This creates: drizzle/migrations/0003_something.sql
+# Commit this file to git.
+```
+
+Never `--force` push in development once you've decided to use migrations. The moment you go migration-based, stick with it.
+
+### 2. Run Migrations at App Startup
+
+In your server entry point (`server.ts` or wherever you initialize the DB):
+
+```typescript
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
+import Database from 'better-sqlite3';
+
+const sqlite = new Database(process.env.DB_PATH || './data/app.db');
+export const db = drizzle(sqlite);
+
+// Run pending migrations on startup
+migrate(db, { migrationsFolder: './drizzle/migrations' });
+```
+
+This runs automatically when your container starts. It's idempotent — already-applied migrations are skipped. It's fast — SQLite migrations are local, no network.
+
+The key insight: **migration happens inside the container, before the app starts serving requests.** No separate migration job, no coordination, no deploy-then-migrate window where requests hit unmigrated schema.
+
+### 3. The Docker Deploy Flow
+
+```dockerfile
+# In your Dockerfile
+COPY drizzle/migrations ./drizzle/migrations
+# App startup auto-migrates
+CMD ["node", "server.js"]
+```
+
+```yaml
+# docker-compose.yml — no migrate step needed
+services:
+  app:
+    image: myapp:latest
+    volumes:
+      - ./data:/app/data  # SQLite file persists here
+```
+
+```bash
+# Deploy:
+docker compose up -d --force-recreate
+# New container starts → migrate() runs → app serves
+```
+
+The SQLite file lives in a bind-mounted volume, persists across container restarts, and the new schema is applied automatically.
+
+## The WAL Mode Gotcha
+
+When you create a new SQLite database in production, you want WAL (Write-Ahead Logging) mode. It allows concurrent reads during writes and is significantly faster for web apps.
+
+The problem: **WAL mode creates sidecar files** (`app.db-wal` and `app.db-shm`). If you copy the database file without these files, you get an inconsistent state.
+
+Always back up all three files together:
+
+```bash
+# Wrong:
+cp data/app.db backup/app.db
+
+# Right:
+cp data/app.db data/app.db-wal data/app.db-shm backup/
+```
+
+Or use SQLite's online backup API:
+
+```bash
+sqlite3 data/app.db ".backup backup/app.db"
+```
+
+The `.backup` command is WAL-aware and produces a consistent snapshot even with active writers.
+
+## The `NOT NULL` Without Default Trap
+
+This one trips everyone. You add a column to your Drizzle schema:
+
+```typescript
+export const products = sqliteTable('products', {
+  id: integer('id').primaryKey(),
+  name: text('name').notNull(),
+  sku: text('sku').notNull(),  // NEW: adding this
+});
+```
+
+You run `drizzle-kit generate`. The SQL looks fine. You apply it locally. Works great.
+
+In production, with existing rows in the table: SQLite can't add a `NOT NULL` column without a default if there are existing rows. The migration fails.
+
+**Fix:** Always add a default when adding `NOT NULL` columns to existing tables:
+
+```typescript
+sku: text('sku').notNull().default(''),
+```
+
+You can remove the default in a *subsequent* migration once you've backfilled the data. Two-phase migration for additive schema changes is a real pattern, not premature engineering.
+
+## Generating Migration Names That Help
+
+By default, drizzle-kit generates names like `0003_overconfident_terrax.sql` (it uses a word generator). These names tell you nothing.
+
+You can name them:
+
+```bash
+pnpm drizzle-kit generate --name add_sku_to_products
+# Creates: 0003_add_sku_to_products.sql
+```
+
+Future-you will thank present-you when debugging which migration caused that production incident at 2 AM.
+
+## When to Break the Rules
+
+Sometimes `push` is the right call even in production:
+
+- **Early-stage project** — if you can afford downtime and a data wipe, push is faster
+- **Dev/staging only** — push is fine on non-production environments
+- **Emergency hotfix** — if a column is missing and you need it NOW, a careful manual push on a backup-verified database is sometimes the fastest path
+
+The rule isn't "never use push." The rule is "know what you're doing when you do."
+
+## Practical Checklist for SQLite + Drizzle in Production
+
+Before shipping:
+
+- [ ] Switch from `push` to `generate` + `migrate()`
+- [ ] Add `migrate()` call to server startup
+- [ ] Mount SQLite file on a persistent volume, not inside the container
+- [ ] Enable WAL mode on first run: `PRAGMA journal_mode=WAL;`
+- [ ] Backup all three SQLite files together
+- [ ] Use `--name` flag for descriptive migration filenames
+- [ ] Test migrations against a copy of production data before deploying
+- [ ] Review generated SQL before committing — Drizzle's diffs are usually correct, but not always
+
+The biggest migration mistake: assuming that because it worked in dev, it'll work in prod. SQLite in Docker with live data is not the same as SQLite in dev with seeded test data. Take 10 minutes to review the generated SQL. The create-copy-drop sequences are where bugs hide.
+
+---
+
+*Based on real experience building and deploying Viatex, a Ukrainian e-commerce platform, using Remix/React Router + Drizzle + SQLite in Docker containers.*
