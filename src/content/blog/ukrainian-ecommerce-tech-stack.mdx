@@ -1,0 +1,219 @@
+---
+title: "Building an E-commerce Store for a Ukrainian SMB in 2026"
+description: "What the stack actually looks like: Hono, SQLite, Nova Poshta, Ukrainian slug transliteration, and shipping logistics during wartime."
+pubDate: "2026-02-18"
+tags: ["ukraine", "ecommerce", "hono", "sqlite", "nova-poshta", "typescript"]
+---
+
+Last month I built a full internet store for a Ukrainian small business — a socks manufacturer in Kyiv Oblast. Here's what the tech stack looks like when you're building for the Ukrainian market specifically, not just a generic WooCommerce clone.
+
+## The Brief
+
+The client sells branded socks: corporate logo orders, retail packs, individual pairs. They had a Wix landing page with a contact form. The brief was: add an internet store, product catalog, categories, admin panel to manage inventory, and eventually integrate with Nova Poshta for shipping.
+
+No payment gateway integration in v1 — Ukrainian SMBs often prefer bank transfer or cash-on-delivery. Payment via Monobank QR code (MBO) is the default for small merchants.
+
+## The Stack
+
+```
+React Router v7 (SSR) + Hono + TypeScript
+SQLite via better-sqlite3 + Drizzle ORM
+Tailwind CSS
+Docker (Alpine) for production
+```
+
+No external database. SQLite is the right call for a Ukrainian SMB site: simple backup (just copy the file), runs on a €5 VPS, zero maintenance. The site doesn't get thousands of simultaneous writes — it gets a few hundred visitors a day and occasional admin sessions.
+
+## Ukrainian-Specific: Slug Transliteration
+
+Product URLs need to be meaningful for Ukrainian SEO. A product named **"Шкарпетки чоловічі класичні"** should slug to something like `shkarpatky-cholovichi-klasychni`, not a URL-encoded mess.
+
+Ukrainian transliteration follows KMU 2010 rules — the official Cabinet of Ministers standard used for passports and street signs. Here's a simplified version:
+
+```typescript
+const UA_TO_LATIN: Record<string, string> = {
+  'а': 'a', 'б': 'b', 'в': 'v', 'г': 'h', 'ґ': 'g',
+  'д': 'd', 'е': 'e', 'є': 'ye', 'ж': 'zh', 'з': 'z',
+  'и': 'y', 'і': 'i', 'ї': 'yi', 'й': 'y', 'к': 'k',
+  'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p',
+  'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f',
+  'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch',
+  'ь': '', 'ю': 'yu', 'я': 'ya',
+};
+
+export function slugifyUkrainian(text: string): string {
+  return text
+    .toLowerCase()
+    .split('')
+    .map(char => UA_TO_LATIN[char] ?? char)
+    .join('')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+```
+
+The admin panel auto-generates slugs as you type the product name — Ukrainian input, Latin slug appears in real time. Essential UX for a Ukrainian-speaking admin.
+
+## Schema: Products and Variants
+
+The socks business has a classic variant problem: one product (say, "Класичні чоловічі") comes in sizes 40-45, sold in packs of 12 pairs. The pricing is per-pair, but customers buy packs.
+
+```typescript
+export const products = sqliteTable('products', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  slug: text('slug').notNull().unique(),
+  sku: text('sku').notNull().unique(),
+  categoryId: text('category_id').references(() => categories.id),
+  pricePerPair: integer('price_per_pair').notNull(), // in kopiyky (UAH * 100)
+  pairsPerPack: integer('pairs_per_pack').notNull().default(1),
+  stockPacks: integer('stock_packs').notNull().default(0),
+  isActive: integer('is_active', { mode: 'boolean' }).default(true),
+  isFeatured: integer('is_featured', { mode: 'boolean' }).default(false),
+  heroImageUrl: text('hero_image_url'),
+  description: text('description'),
+  metaTitle: text('meta_title'),
+  metaDescription: text('meta_description'),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+});
+
+export const productVariants = sqliteTable('product_variants', {
+  id: text('id').primaryKey(),
+  productId: text('product_id').notNull().references(() => products.id),
+  size: text('size').notNull(), // '40', '41-42', 'one-size'
+  stockPacks: integer('stock_packs').notNull().default(0),
+});
+```
+
+Money in kopiyky. Always store money as integers — floating-point UAH causes rounding bugs at checkout.
+
+## Nova Poshta Integration (The Real Challenge)
+
+Nova Poshta is Ukraine's dominant parcel carrier. For an e-commerce store, you need:
+
+1. **City/branch lookup** — Customer types their city, you search NP API for branches
+2. **Shipping cost estimate** — Based on weight, city, payment type
+3. **Waybill creation** — When order is ready to ship
+4. **Tracking** — Customer can check parcel status
+
+The NP API is documented in Ukrainian and reasonably well-designed, but it uses a JSON-RPC style (everything is POST to one endpoint) which feels odd if you're used to REST:
+
+```typescript
+const NP_API = 'https://api.novaposhta.ua/v2.0/json/';
+
+async function searchCities(query: string) {
+  const res = await fetch(NP_API, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      apiKey: process.env.NOVA_POSHTA_API_KEY,
+      modelName: 'Address',
+      calledMethod: 'searchSettlements',
+      methodProperties: {
+        CityName: query,
+        Limit: 10,
+        Page: 1,
+      },
+    }),
+  });
+  const data = await res.json();
+  return data.data[0]?.Addresses ?? [];
+}
+```
+
+The `modelName` + `calledMethod` pattern is their RPC naming — takes 30 minutes to get used to, then it's fine. The bigger issue: their API has **rate limits that aren't clearly documented**. We hit them during testing by hammering the city search. Solution: debounce on the frontend (300ms) and cache city results in SQLite for 24h.
+
+## What Wartime Changes
+
+Building Ukrainian e-commerce in 2026 means accounting for things that don't appear in Stack Overflow answers:
+
+**Shipping zones**: Nova Poshta doesn't deliver to active conflict zones. The store needed to display a message if the customer's city wasn't serviceable — gracefully, not with a 500 error. We added a `isServiceable` check from the NP response.
+
+**Power outages**: The VPS is in Germany (Hetzner NBG), so the server stays up. But if the client's internet goes out, they can't access the admin panel to manage orders. We made the Telegram bot notifications richer — so they can at least see new orders on their phone during an outage.
+
+**Currency**: UAH is the only currency for domestic sales. No EUR/USD complexity. Price display is simple: `{(pricePerPair * pairsPerPack / 100).toFixed(2)} ₴` — the kopiyky-to-hryvnia conversion happens at display time.
+
+**Payment**: Monobank QR codes are Ukraine's informal payment standard for SMBs. The store generates a static QR code image (from Monobank's jar/send-money URL) on the order confirmation page. No Stripe, no PayPal, no WayForPay (yet). It works.
+
+## The Admin Panel
+
+The admin panel was last. Creating products required:
+
+- Ukrainian name input → auto-slug generation
+- Category dropdown (seeded from DB)
+- Pricing: base price, per-pair price, packs-per-unit
+- Stock count
+- Description (short + full)
+- Hero image URL (for now — S3 upload comes later)
+- SEO fields (meta title, description)
+- Active/featured toggles
+
+The create form is 383 lines of React Router action + Zod validation + HTML. Long but boring. The interesting part was the **slug preview** — updating in real time as the Ukrainian product name changes:
+
+```typescript
+function ProductForm() {
+  const [name, setName] = useState('');
+  const [slug, setSlug] = useState('');
+  const [slugEdited, setSlugEdited] = useState(false);
+
+  useEffect(() => {
+    if (!slugEdited && name) {
+      setSlug(slugifyUkrainian(name));
+    }
+  }, [name, slugEdited]);
+
+  return (
+    <input
+      value={name}
+      onChange={e => setName(e.target.value)}
+      placeholder="Назва товару"
+    />
+    <input
+      value={slug}
+      onChange={e => { setSlug(e.target.value); setSlugEdited(true); }}
+      placeholder="url-slug"
+    />
+  );
+}
+```
+
+Once the user manually edits the slug, it stops auto-updating. This is the standard UX pattern — WordPress does the same thing.
+
+## Deployment
+
+```dockerfile
+FROM node:20-alpine AS build-env
+COPY . /app/
+COPY --from=deps /app/node_modules /app/node_modules
+WORKDIR /app
+RUN pnpm build
+
+FROM node:20-alpine
+RUN apk add --no-cache sqlite
+# ... copy build artifacts, not source
+CMD ["node", "./build/server/index.js"]
+```
+
+The DB lives in a Docker volume: `/app/data/viatex.db`. Backup is a cron job that copies the file to Backblaze B2 every 6 hours.
+
+One gotcha: the build-time SQLite connection. Drizzle's `push:sqlite` generates schema from source — but in production you run migrations, not push. We have a `scripts/migrate.ts` that runs on container start and is compiled into the build.
+
+## What v1 Looks Like Now
+
+- Homepage: featured products, category grid
+- `/katalog` — full catalog with text search
+- `/kategoria/:slug` — category pages  
+- `/produkt/:slug` — individual product with variants
+- `/admin/products` — list, filter, view
+- `/admin/products/new` — create product
+- Dynamic sitemap: all catalog, category, and product URLs indexed by Google
+- Telegram bot: new orders + status changes notify the owner on their phone
+- MBO payment QR on order confirmation
+
+Total: about 6 weeks of on-and-off work, mostly after midnight.
+
+The Ukrainian e-commerce market is smaller than Poland or Germany, but the technical problems are the same. Nova Poshta's API is better-documented than some European carriers I've integrated with. And SQLite on a €5 VPS handles a sock manufacturer's order volume without breaking a sweat.
+
+---
+
+*The store launches when the client's Google Drive full of product photos finally arrives. It's been "this weekend" for three weeks now. The code waits.*
