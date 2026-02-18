@@ -1,0 +1,250 @@
+---
+title: "Why I Switched Every New API to Hono (And What It Costs You)"
+description: "Real-world notes from migrating a production cargo SaaS from a Firebase/Express setup to Hono + Kysely + SQLite. The good parts, the painful parts, and what nobody tells you."
+pubDate: "2026-02-18"
+tags: ["hono", "typescript", "api", "backend", "saas"]
+---
+
+When I started rebuilding GoVantazh — a multi-tenant cargo management platform used by Ukrainian logistics companies — I had a decision to make on the API layer. The old setup was a mess of Firebase Functions, Express, and hand-rolled type casting. I looked at the options: Fastify, tRPC, bare Bun HTTP, NestJS (no), and Hono.
+
+I picked Hono. Six months later, I'm still picking Hono. Here's an honest breakdown.
+
+## What Hono Actually Is
+
+Hono is a lightweight web framework built on the Web Standards API — `Request`, `Response`, `Headers`, `URL`. The same API your browser uses. This sounds like a minor implementation detail. It's not.
+
+Because Hono runs on the Web Standards API, it runs _anywhere_:
+- Node.js (via `@hono/node-server`)
+- Cloudflare Workers (natively)
+- Bun (natively)
+- Deno (natively)
+- AWS Lambda (with an adapter)
+
+You write one codebase. You decide at deploy time where it runs. That's the actual value proposition.
+
+## The Setup That Actually Works
+
+For a production multi-tenant SaaS, here's the stack I landed on:
+
+```typescript
+// packages/api/src/index.ts
+import { Hono } from 'hono'
+import { cors } from 'hono/cors'
+import { logger } from 'hono/logger'
+import { serve } from '@hono/node-server'
+import { ordersRouter } from './routes/orders.js'
+import { driversRouter } from './routes/drivers.js'
+import { db } from '@govantazh/db'
+
+type AppEnv = {
+  Variables: {
+    tenantId: string
+    userId: string
+    db: typeof db
+  }
+}
+
+const app = new Hono<AppEnv>()
+
+app.use('*', logger())
+app.use('/api/*', cors({ origin: process.env.FRONTEND_URL! }))
+app.use('/api/*', tenantMiddleware())
+app.use('/api/*', authMiddleware())
+
+app.route('/api/orders', ordersRouter)
+app.route('/api/drivers', driversRouter)
+
+serve({ fetch: app.fetch, port: 3000 })
+```
+
+The `AppEnv` type is how Hono does dependency injection. `c.var.tenantId` is fully typed everywhere. No context casting, no `req.user as User` gymnastics.
+
+## What's Genuinely Better Than Express
+
+### 1. Type inference that actually works
+
+In Express, you're constantly fighting the types. Route params are `Record<string, string>`. Query params are `any`. You end up writing type assertions or using libraries like `zod-express-middleware` to paper over it.
+
+Hono's validator middleware does this cleanly:
+
+```typescript
+import { zValidator } from '@hono/zod-validator'
+import { z } from 'zod'
+
+const updateOrderSchema = z.object({
+  status: z.enum(['pending', 'processing', 'shipped', 'delivered']),
+  driverId: z.string().uuid().optional(),
+})
+
+ordersRouter.patch(
+  '/:id/status',
+  zValidator('json', updateOrderSchema),
+  async (c) => {
+    const { status, driverId } = c.req.valid('json') // fully typed, no casting
+    const { id } = c.req.param() // also typed
+    const tenantId = c.var.tenantId // injected by middleware, typed
+    
+    // ...
+  }
+)
+```
+
+`c.req.valid('json')` returns the exact inferred type of your Zod schema. No type assertions. TypeScript catches mismatches at compile time.
+
+### 2. Middleware typing is sane
+
+The `AppEnv` pattern (or more precisely, `Env` in Hono terms) lets you type what middleware puts into context:
+
+```typescript
+// middleware/auth.ts
+export function authMiddleware() {
+  return createMiddleware<AppEnv>(async (c, next) => {
+    const token = c.req.header('Authorization')?.replace('Bearer ', '')
+    if (!token) return c.json({ error: 'Unauthorized' }, 401)
+    
+    const session = await validateSession(token)
+    if (!session) return c.json({ error: 'Invalid session' }, 401)
+    
+    c.set('userId', session.userId)
+    c.set('tenantId', session.tenantId)
+    
+    await next()
+  })
+}
+```
+
+Routes that run after this middleware get `c.var.userId` and `c.var.tenantId` fully typed. If you forget to add a middleware but try to access its variables, TypeScript tells you immediately.
+
+### 3. SSE (Server-Sent Events) built in
+
+GoVantazh uses SSE for real-time cargo updates — drivers' positions, status changes, new assignments. In Express this requires the `eventsource` package and hand-rolling the response headers. In Hono:
+
+```typescript
+ordersRouter.get('/stream', (c) => {
+  return streamSSE(c, async (stream) => {
+    const tenantId = c.var.tenantId
+    
+    while (true) {
+      const updates = await pollForUpdates(tenantId)
+      
+      for (const update of updates) {
+        await stream.writeSSE({
+          data: JSON.stringify(update),
+          event: 'cargo-update',
+          id: update.id,
+        })
+      }
+      
+      await stream.sleep(2000)
+    }
+  })
+})
+```
+
+That's it. No manual `res.setHeader('Content-Type', 'text/event-stream')`, no `res.flushHeaders()`, no fighting with compression middleware.
+
+## The Painful Parts (Nobody Tells You)
+
+### Ecosystem gaps vs Express
+
+Express has had 14 years of middleware ecosystem development. Hono hasn't. If you need something niche — specific auth strategies, complex session handling, unusual middleware patterns — you'll often write it yourself.
+
+This isn't always bad (writing your own session middleware is actually educational), but it's real work you should budget for.
+
+### Error handling is your problem
+
+Hono doesn't have Express's error-handling middleware pattern (`(err, req, res, next)`). You set a global error handler:
+
+```typescript
+app.onError((err, c) => {
+  console.error(err)
+  return c.json({ error: 'Internal server error' }, 500)
+})
+```
+
+But structured error propagation — like throwing a typed `AppError` anywhere in a route and having it surface correctly — needs design work. I ended up with a custom error class:
+
+```typescript
+export class AppError extends Error {
+  constructor(
+    public readonly statusCode: number,
+    message: string,
+    public readonly code?: string,
+  ) {
+    super(message)
+  }
+}
+
+app.onError((err, c) => {
+  if (err instanceof AppError) {
+    return c.json({ error: err.message, code: err.code }, err.statusCode)
+  }
+  console.error('Unhandled error:', err)
+  return c.json({ error: 'Internal server error' }, 500)
+})
+```
+
+Not hard, but you have to think about it upfront.
+
+### File uploads are awkward
+
+Hono's built-in body parsing handles JSON beautifully. File uploads (multipart/form-data) work, but the API is less ergonomic than Express + Multer. For GoVantazh's payment proof upload feature:
+
+```typescript
+ordersRouter.post('/upload-proof', async (c) => {
+  const body = await c.req.parseBody()
+  const file = body['file']
+  
+  if (!(file instanceof File)) {
+    return c.json({ error: 'No file provided' }, 400)
+  }
+  
+  const bytes = await file.arrayBuffer()
+  const buffer = Buffer.from(bytes)
+  
+  // Now do what you want with buffer
+})
+```
+
+It works. It's just more verbose than `req.file.buffer` from Multer. I'm not complaining loudly, but it's a genuine rougher edge.
+
+## The Performance Question
+
+Is Hono faster than Express?
+
+Yes, measurably. Hono consistently benchmarks 2-5x faster than Express on throughput. In practice, for most applications your database is the bottleneck, not the HTTP layer, so this rarely matters.
+
+Where it *does* matter: if you have CPU-bound routes, or if you're doing heavy middleware processing on every request, Hono's lighter overhead compounds. For GoVantazh — where some routes join across multiple SQLite files — we're not I/O bound enough for this to be the limiting factor. But it's a real advantage at scale.
+
+## When to Use It, When Not To
+
+**Use Hono when:**
+- You're building a new TypeScript API from scratch
+- You want runtime portability (today Node, maybe Workers tomorrow)
+- You value tight TypeScript integration
+- Your team is comfortable writing more code from scratch
+
+**Stick with Express (or use Fastify) when:**
+- You have a large existing Express codebase
+- You need specific Express middleware that doesn't have Hono equivalents
+- You're on a tight deadline and need battle-tested ecosystem plugins
+
+**Avoid NestJS always** (kidding, but also not really).
+
+## What I'd Change
+
+If I were starting over, I'd abstract my DB access more cleanly behind a repository layer rather than importing `db` directly into routes. Not a Hono problem — a design problem I made early that Hono's architecture didn't prevent.
+
+I'd also set up `hono/client` (the type-safe RPC client) from day one. It generates a fully-typed fetch client from your Hono routes, eliminating the need for a separate OpenAPI spec or manual API type definitions. I added it after the fact, which meant some retrofitting.
+
+## The Verdict
+
+Hono is what Express should have been if it were designed for TypeScript from the ground up. It's not perfect — the ecosystem is thinner, file uploads are clunky, and error handling requires forethought. But the type inference is genuinely excellent, the performance is real, and the Web Standards API foundation pays dividends.
+
+For new TypeScript APIs: Hono, no contest. For migrating existing Express apps: do it selectively, not all at once.
+
+If you're building something similar to GoVantazh — a multi-tenant SaaS backend that needs real-time updates, structured auth, and clean TypeScript types — Hono + Kysely + Zod is a stack worth taking seriously.
+
+---
+
+*I'm building GoVantazh in public — a Ukrainian cargo management platform. If you're curious about the architecture, [reach out](https://github.com/SeMmyT).*
