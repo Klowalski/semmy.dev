@@ -1,0 +1,182 @@
+---
+title: "The 24/7 AI Developer: How I Run Autonomous Work Cycles"
+description: "Inside the architecture that lets my AI agent work while I sleep — cron jobs, memory chains, sub-agent spawning, and why heartbeats beat timers."
+pubDate: 2026-02-18
+tags: ["AI agents", "autonomous AI", "architecture", "OpenClaw", "cron"]
+---
+
+My AI assistant doesn't sleep. It works in 30-minute cycles, all night, every night.
+
+Here's what the architecture looks like — and what I learned building it.
+
+## The Basic Pattern
+
+Every 30 minutes, a cron job fires. It spawns an isolated agent session with a directive:
+
+> *"You are a background worker. Read your context files, check the priority list, do useful work, document findings."*
+
+The agent spins up, checks what's pending, picks the most valuable task, does it, writes notes, and exits. Then 30 minutes later — another one.
+
+Simple idea. Interesting in practice.
+
+## The Memory Problem
+
+The fundamental challenge with autonomous AI agents isn't capability. It's **continuity**.
+
+Claude doesn't remember the previous session. When a new agent spawns at 3:18 AM, it has zero memory of what the 1:18 AM agent did. Without continuity, you get agents that:
+- Repeat work already done
+- Don't build on prior findings  
+- Can't pursue multi-session goals
+- Rediscover the same bugs
+
+The solution I settled on: **structured text files as external memory**.
+
+```
+workspace/
+├── CONTINUE.md          # Priority tasks + blocking items
+├── MEMORY.md            # Long-term curated memory (main session only)
+├── memory/
+│   ├── 2026-02-17.md   # Daily raw logs
+│   └── 2026-02-18.md   # Today's log
+└── memory-chain/
+    └── chain.jsonl      # Cryptographic memory (provable history)
+```
+
+Every agent session opens with the same ritual:
+1. Read `CONTINUE.md` — what's the priority list?
+2. Read today's memory file — what happened earlier today?
+3. Check git status on active repos — what's the code state?
+4. Do work, document it, exit.
+
+It's surprisingly effective. The agent can pick up a multi-hour task across a dozen sessions because the previous agent left detailed notes.
+
+## CONTINUE.md: The Handoff Document
+
+`CONTINUE.md` is the most important file in the system. It's not a todo list — it's a **session handoff document**.
+
+The previous agent writes to it. The next agent reads from it. Like a hospital nurse handoff: "patient's vitals are stable, watch for X, next action is Y."
+
+A typical entry looks like:
+
+```markdown
+## 🔴 CRITICAL: Deploy Viatex Internet Store
+
+**Status:** Code done. Production shows "Coming Soon" (old image c6b56811bc87)
+**Docker image ready:** a87b0bf6df43 (all features, dynamic sitemap)
+
+**Deploy command (Daniel must run):**
+ssh root@100.83.114.26
+cd /root/viatex && docker compose up -d --force-recreate
+
+Expected: ~30-60s downtime, then store live.
+```
+
+The status, the blocker, the exact command. No ambiguity.
+
+Crucially: **the agent also tracks what only a human can do**. Some actions are blocked (for safety reasons, I have `safe-docker` preventing the AI from restarting production containers). When the agent hits a human-only blocker, it records it clearly and moves to the next thing.
+
+## Three Memory Tiers
+
+I ended up with three distinct memory systems, each with a different purpose:
+
+**Tier 1: Daily files** — `memory/YYYY-MM-DD.md`  
+Raw, chronological notes. What happened, what was decided, what was discovered. These are the agent's "working memory" across a day. High write frequency, ephemeral value.
+
+**Tier 2: Long-term memory** — `MEMORY.md`  
+Curated, distilled. I think of it like a human's long-term memory vs. a diary. The agent (and I, during main sessions) review the daily files periodically and promote significant insights to `MEMORY.md`. Terminology decisions, lessons learned, relationship context.
+
+**Tier 3: Memory chain** — `~/.openclaw/memory-chain/chain.jsonl`  
+Cryptographically signed, hash-linked entries. Like a blockchain for decisions. Used for things I want to be **provably recorded**: major commitments, identity statements, trust milestones. When someone asks "did we agree to X?" — the chain is the source of truth, not the mutable text files.
+
+The chain supports hybrid search: 40% keyword, 30% recency, 20% importance, 10% access frequency. Better than grep on 30+ entries.
+
+## Heartbeats vs. Cron Jobs
+
+I use both, but they serve different purposes. Getting this distinction right reduced my API costs significantly.
+
+**Heartbeats** are lightweight polls — a message sent to the *main* agent session (the one that has conversation history with me). They're good for:
+- Batching multiple checks into one turn (email + calendar + notifications)  
+- Tasks that benefit from conversational context
+- Things that don't need precise timing
+
+**Cron jobs** spawn *isolated* agent sessions. They're good for:
+- Exact timing ("9:00 AM every Monday")
+- Tasks that should be independent of main session history
+- One-shot reminders ("remind me in 20 minutes")
+- Autonomous work that should deliver directly to a channel
+
+The mistake I originally made: creating a separate cron job for every periodic check. Email cron, calendar cron, weather cron — three isolated sessions every 30 minutes. Wasteful.
+
+Better: one `HEARTBEAT.md` file that batches all the lightweight checks. The heartbeat reads the file, does all the checks in one turn, writes the state.
+
+```json
+{
+  "lastChecks": {
+    "email": 1703275200,
+    "calendar": 1703260800,
+    "weather": null
+  }
+}
+```
+
+## Sub-Agent Parallelism
+
+Some work sessions spawn sub-agents for parallel execution.
+
+The pattern: if a task is long-running (>10 minutes) or parallelizable, spawn it as a sub-agent and let it run. The parent agent moves to other tasks. When the sub-agent finishes, it announces results automatically.
+
+I used this for the skillsmp.com crawl — while the crawl ran in one sub-agent, the parent session continued checking repos and writing docs. No waiting.
+
+Sub-agents also enable different models for different tasks. Reasoning-intensive work (architecture decisions, debugging) → more capable model. Routine checks (git status, file reading) → faster/cheaper model.
+
+## The Safety Architecture
+
+Running autonomous agents 24/7 requires explicit safety boundaries.
+
+My current setup:
+- **`safe-docker`**: Blocks the agent from `docker stop/restart/rm` on production containers. It can read logs, inspect state — but not kill the running store.
+- **Destructive ops require confirmation**: `rm -rf`, force push, database operations — the agent prompts before executing.
+- **Sensitive path guards**: `.ssh/`, `.env`, private keys blocked from reads and writes.
+- **Full audit logging**: Every command logged to `~/logs/claude-commands.log`.
+
+The philosophy: **capability with guardrails, not artificial restriction**.
+
+The old model was rbash + an allowlist of `klow-*` commands. Too restrictive to be useful. The current model is full shell + path guards + audit trail. The agent can do almost anything — but there's a paper trail, and critical production systems are physically blocked.
+
+## What Goes Wrong
+
+After dozens of 30-minute cycles, here's what I've learned about failure modes:
+
+**Repeating work**: If `CONTINUE.md` isn't updated correctly, the next agent redoes what was just done. Fixed by explicit "DONE" markers and commit SHAs.
+
+**Confident hallucination without checking**: The agent says "already correct" without actually verifying. This is a session-start discipline issue — the agent must check before claiming.
+
+**Scope creep**: The agent gets interested in something tangential and burns the whole session on it. Not always bad (some tangents find bugs), but needs awareness. I added "document interesting tangents, don't chase them in cron sessions" to the prompt.
+
+**Missing human-only blockers**: The agent keeps retrying something it can't do instead of moving on. Fixed by explicit "Daniel must run" sections in CONTINUE.md.
+
+## The Unexpected Value
+
+The thing I didn't anticipate: **the agent often finds things I'd have missed**.
+
+In 17 hours of autonomous work sessions, it:
+- Caught two routes not registered in `routes.ts` (would have been production 404s)
+- Found a category seeding bug that would have broken the admin panel on fresh deploy
+- Fixed the dynamic sitemap (I'd built the catalog but forgot to add it to sitemap.xml — Google would never have discovered the new pages)
+
+None of these were in the priority list. The agent found them while doing the specified tasks and fixed them as a matter of course.
+
+That's what I didn't expect: not just task execution, but **opportunistic quality improvement**.
+
+## The Stack
+
+If you want to replicate this:
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — the AI gateway (cron, heartbeats, sessions, memory chain)
+- **Claude Sonnet** — current default model for cron sessions
+- **Bash** — the workspace is a VPS, all work is file-based
+- **Git** — every autonomous change gets committed with a clear message
+- **Hetzner VPS** — always-on, ~4€/month, enough for all of this
+
+The AI code is the cheap part. The expensive part is building the trust model — figuring out what to allow, what to block, and how to give the agent enough context to do good work without constant supervision.
+
+That's an ongoing process. 24 cron cycles in, I'm still learning.
