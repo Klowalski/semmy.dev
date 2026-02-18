@@ -1,0 +1,151 @@
+---
+title: "One Database Per Tenant: SQLite's Hidden Superpower for SaaS"
+description: "Why I abandoned shared PostgreSQL schemas and gave every tenant their own SQLite file — and why it turned out to be the right call."
+pubDate: "2026-02-18"
+tags: ["sqlite", "architecture", "saas", "multi-tenant", "backend"]
+---
+
+Multi-tenancy is one of those problems where the "standard" answer feels obvious until you actually live with it.
+
+Shared database, separate schemas. Row-level isolation with a `tenant_id` column everywhere. Everyone does it this way. PostgreSQL handles it fine. What's the problem?
+
+The problem is that *fine* isn't good enough when a single slow query from one tenant degrades response times for everyone else. Or when you need to backup or migrate one tenant's data without touching the others. Or when a tenant churns and you need to purge their data completely — and you're now running `DELETE FROM every_table WHERE tenant_id = ?` against tables with millions of rows.
+
+I ran into all of these while building GoVantazh, a logistics SaaS for Ukrainian freight companies. Here's what I learned switching to **one SQLite file per tenant**.
+
+---
+
+## The Setup
+
+Each tenant gets their own directory under `data/`:
+
+```
+data/
+  proexpedite/
+    tenant.db        ← the whole tenant in one file
+    .env             ← tenant-specific secrets
+    docker-compose.yml
+  maxcargo/
+    tenant.db
+    .env
+    docker-compose.yml
+```
+
+The API layer knows which database to open based on the subdomain or a lookup table. Connection pooling per tenant is lightweight because SQLite has basically zero connection overhead.
+
+```typescript
+// Simplified tenant resolution
+const db = getOrCreateTenantDb(tenantId);
+// Returns a cached Drizzle instance backed by data/{tenantId}/tenant.db
+```
+
+---
+
+## What You Actually Gain
+
+### 1. True Isolation
+
+A query that locks `data/maxcargo/tenant.db` doesn't affect `data/proexpedite/tenant.db`. Zero noisy-neighbor problems. For write-heavy workloads this matters enormously — and logistics software is *very* write-heavy (every GPS ping, every status update, every driver assignment is a write).
+
+### 2. Trivial Backup
+
+```bash
+cp data/proexpedite/tenant.db backups/proexpedite-$(date +%Y%m%d).db
+```
+
+That's it. The whole tenant, atomically consistent, in a single `cp`. No `pg_dump`, no schema version tracking, no partial restores.
+
+Compare this to dumping rows for one tenant from a shared Postgres table with 50M rows. Not fun.
+
+### 3. Instant Purge
+
+Tenant churns? Three lines:
+
+```bash
+rm -rf data/churned-tenant/
+# Remove from tenant registry
+# Done.
+```
+
+No `DELETE FROM orders WHERE tenant_id = ?` across 20 tables. No vacuuming the freed space. Just... gone.
+
+### 4. Per-Tenant Schema Evolution
+
+This one surprised me. When you need to migrate one tenant's schema (maybe they're on a legacy plan with different features), you can run migrations selectively:
+
+```bash
+drizzle-kit migrate --config drizzle.proexpedite.config.ts
+# Only touches proexpedite's database
+```
+
+In a shared schema world, you're either migrating everyone atomically (risky) or maintaining complex feature-flag columns forever.
+
+---
+
+## What You Lose (And How To Handle It)
+
+### Cross-Tenant Queries
+
+You can't `JOIN` across tenants. If you need aggregate analytics across all tenants, you have three options:
+
+1. **Accept it** — most SaaS analytics don't need real-time cross-tenant data
+2. **Shadow writes** — append important events to a separate analytics database
+3. **ETL on demand** — collect tenant stats periodically into a separate reporting store
+
+For GoVantazh, option 1 was fine. Tenant owners care about their own data. The platform owner (us) can run reports by iterating over tenant files when needed.
+
+### Connection Limits
+
+Each tenant needs at least one open file descriptor. With 100 tenants, that's 100+ SQLite connections. Easily manageable — Linux handles hundreds of thousands of file descriptors. Just make sure you're not opening a new connection per request without pooling.
+
+```typescript
+// Good: cache per tenant
+const tenantDbs = new Map<string, Database>();
+
+function getTenantDb(tenantId: string): Database {
+  if (!tenantDbs.has(tenantId)) {
+    tenantDbs.set(tenantId, new Database(`data/${tenantId}/tenant.db`));
+  }
+  return tenantDbs.get(tenantId)!;
+}
+```
+
+### WAL Mode Is Non-Negotiable
+
+Enable WAL mode on every tenant database at creation time:
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA busy_timeout=5000;
+```
+
+Without WAL, concurrent reads block writes. With WAL, reads and writes proceed in parallel. This is the difference between "SQLite can't handle production" and "SQLite handles production fine."
+
+---
+
+## The Numbers
+
+GoVantazh went live with 4 production tenants. Each tenant database is 20–80 MB. Total storage: ~300 MB. Backup script runs in under 3 seconds. The slowest queries (driver location history with 30-day window) run in under 100ms.
+
+I'm not saying this scales to 10,000 tenants. At some point you'd need sharding across machines or a different architecture entirely. But for a B2B SaaS with dozens to hundreds of enterprise clients? One SQLite per tenant is *genuinely better* than a shared PostgreSQL schema for most practical metrics.
+
+---
+
+## When Not To Do This
+
+- **High-velocity writes at massive scale** — if each tenant is generating 10,000+ writes/second, you'll want something with better write parallelism than SQLite's single-writer model
+- **You need cross-tenant joins** — if your core product requires comparing data across tenants (like a marketplace), shared storage makes more sense
+- **Horizontal scaling across many machines** — SQLite files on disk don't distribute automatically; you'd need a distributed SQLite solution (Turso, LiteFS) or a different database
+
+---
+
+## The Surprising Part
+
+The thing I didn't expect: **operations people love this**. When a client calls saying their reports look wrong, the first thing you do is `sqlite3 data/theirtenant/tenant.db` and start querying. No access control layers to navigate. No worry about accidentally touching another tenant's data. Just the file, your query, the truth.
+
+Sometimes the right architecture isn't the most sophisticated one. It's the one that makes the hard things easy.
+
+---
+
+*GoVantazh is a logistics management platform for Ukrainian freight companies. Built with Remix, SQLite/Drizzle, and a lot of hard-won production lessons.*
