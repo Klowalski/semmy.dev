@@ -1,0 +1,282 @@
+---
+title: "Telegram as a Backend UI: How I Replaced a Mobile App for Field Workers"
+description: "Why I ditched the mobile app plan for GoVantazh drivers and used Telegram instead — and how to architect the Telegram↔API integration that actually works in production."
+pubDate: "2026-02-18"
+tags: ["telegram", "saas", "architecture", "backend", "typescript", "hono"]
+---
+
+When I was planning GoVantazh — a cargo management SaaS for Ukrainian freight companies — I had a mobile app on the roadmap. Drivers would install it, log in, receive shipment updates, confirm deliveries. Standard stuff.
+
+I never built it. Instead, drivers use Telegram.
+
+Six months in, this is one of the best architectural decisions I made. Here's why, and how I built it.
+
+---
+
+## The Problem with Mobile Apps for Field Workers
+
+Ukrainian truck drivers aren't your typical tech-savvy SaaS users. They're on the road, often with intermittent connectivity, using older Android phones, and deeply allergic to installing new apps from unfamiliar companies.
+
+The adoption funnel for a custom mobile app would have been brutal:
+1. Driver receives link to install APK or go to Play Store
+2. Driver ignores it
+3. Dispatcher calls driver to install the app
+4. Driver says "yeah yeah, I'll do it later"
+5. Driver never does it
+
+Meanwhile, every single one of them already has Telegram. It's deeply embedded in how Ukrainian logistics actually works — coordinators share waypoints, customs documents fly around in group chats, and payment confirmations happen via screenshots forwarded through Telegram chains.
+
+**The insight: meet users where they already are.**
+
+---
+
+## What the Telegram Bot Does
+
+Instead of a mobile app, GoVantazh drivers interact with a Telegram bot:
+
+- **Receive notifications** when a shipment is assigned to them
+- **Get updates** when cargo status changes (loaded, in transit, at customs, delivered)
+- **Confirm actions** by replying to bot messages (or pressing inline keyboard buttons)
+- **Link their Telegram account** to their driver profile in the web admin
+
+Dispatchers see all this activity in real-time in the web dashboard via SSE. When a driver presses "Confirmed receipt" on a bot message, the dispatcher's screen updates in under a second.
+
+---
+
+## The Architecture
+
+```
+Driver's Telegram → Telegram API → Webhook → Hono API → SQLite (per-tenant) → SSE → Admin Dashboard
+```
+
+Three tables drive the integration:
+
+```sql
+-- Telegram accounts that have messaged the bot
+CREATE TABLE telegram_drivers (
+  chat_id TEXT PRIMARY KEY,
+  display_name TEXT,
+  username TEXT,
+  phone TEXT,
+  linked_driver_ids TEXT DEFAULT '[]',  -- JSON array of linked driver doc IDs
+  valid_driver INTEGER DEFAULT 0,
+  autonotify_enabled INTEGER DEFAULT 1,
+  messages_synced INTEGER DEFAULT 0,
+  created_at TEXT,
+  updated_at TEXT
+);
+
+-- Messages received from drivers via Telegram
+CREATE TABLE telegram_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  message_id INTEGER,
+  text TEXT,
+  received_at TEXT,
+  processed INTEGER DEFAULT 0
+);
+
+-- ZIP code updates sent by drivers (location confirmations)
+CREATE TABLE tg_zip_updates (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id TEXT NOT NULL,
+  zip_code TEXT,
+  shipment_id TEXT,
+  created_at TEXT
+);
+```
+
+The `telegram_drivers` table is the link between a Telegram chat ID and a driver record in the system. A driver might have multiple driver doc IDs (if they work for multiple carriers in the same tenant), hence the JSON array.
+
+---
+
+## Linking Telegram to Driver Accounts
+
+The onboarding flow:
+
+1. Dispatcher shares the bot link with a driver: `t.me/govantazh_bot?start=TENANT_CODE`
+2. Driver starts the bot, bot records their `chat_id`
+3. Dispatcher sees the new Telegram account appear in the admin panel (via SSE push)
+4. Dispatcher clicks "Link" and associates the Telegram account with a driver record
+5. From now on, that driver receives notifications automatically
+
+The linking endpoint is atomic — it appends to the driver's `linked_driver_ids` array and updates the driver record's telegram fields in a single transaction:
+
+```typescript
+telegramDrivers.post('/api/telegram-drivers/:chatId/link', async (c) => {
+  const db = c.get('db');
+  const { chatId } = c.req.param();
+  const { driverDocId, phone, username } = await c.req.json();
+  const tenantId = c.get('tenantId');
+
+  // Append to linked_driver_ids (JSON array stored as TEXT)
+  const tgRow = await db
+    .selectFrom('telegram_drivers')
+    .selectAll()
+    .where('chat_id', '=', chatId)
+    .executeTakeFirst();
+
+  const linkedIds: string[] = JSON.parse(tgRow?.linked_driver_ids ?? '[]');
+  if (!linkedIds.includes(driverDocId)) linkedIds.push(driverDocId);
+
+  await db.transaction().execute(async (trx) => {
+    await trx
+      .updateTable('telegram_drivers')
+      .set({ linked_driver_ids: JSON.stringify(linkedIds), updated_at: now })
+      .where('chat_id', '=', chatId)
+      .execute();
+
+    await trx
+      .updateTable('drivers')
+      .set({ telegram_chat_id: chatId, telegram_username: username })
+      .where('doc_id', '=', driverDocId)
+      .execute();
+  });
+
+  // Push SSE update so admin dashboard refreshes without reload
+  sseBroker.publish(`${tenantId}:telegram-drivers`, { action: 'update', data: apiObj });
+  return c.json(apiObj);
+});
+```
+
+After linking, the dispatcher immediately sees the driver show as "Telegram connected" in the UI — no page refresh needed.
+
+---
+
+## Sending Notifications to Drivers
+
+When a shipment status changes, the server sends a Telegram message to all linked drivers:
+
+```typescript
+async function notifyDriversOnStatusChange(
+  tenantId: string,
+  shipmentId: string,
+  newStatus: string,
+  db: Database
+) {
+  // Find all drivers linked to this shipment
+  const assignment = await db
+    .selectFrom('shipment_assignments')
+    .innerJoin('drivers', 'drivers.doc_id', 'shipment_assignments.driver_doc_id')
+    .innerJoin('telegram_drivers', 'telegram_drivers.chat_id', 'drivers.telegram_chat_id')
+    .select(['telegram_drivers.chat_id', 'drivers.name'])
+    .where('shipment_assignments.shipment_id', '=', shipmentId)
+    .where('telegram_drivers.autonotify_enabled', '=', 1)
+    .execute();
+
+  for (const { chat_id, name } of assignment) {
+    await sendTelegramMessage(chat_id, buildStatusMessage(name, shipmentId, newStatus));
+  }
+}
+```
+
+The `buildStatusMessage` function uses Ukrainian text — the entire bot interface is in Ukrainian, which matters for user adoption.
+
+---
+
+## The Webhook Handler
+
+Telegram sends updates to your webhook URL. In Hono:
+
+```typescript
+app.post('/webhook/telegram/:tenantToken', async (c) => {
+  const update = await c.req.json();
+  const { message, callback_query } = update;
+  
+  if (message?.text) {
+    await handleIncomingMessage(c, message);
+  }
+  
+  if (callback_query) {
+    await handleCallbackQuery(c, callback_query);
+  }
+  
+  return c.text('OK');
+});
+```
+
+The `tenantToken` in the URL is how multi-tenant works here — each tenant registers their bot webhook at a different path. The middleware resolves which SQLite database to use based on the token.
+
+**Important:** Telegram requires your webhook to respond with `200 OK` within 60 seconds. Any expensive processing should be queued, not done inline. I use a simple async fire-and-forget:
+
+```typescript
+async function handleIncomingMessage(c: Context, message: TelegramMessage) {
+  const chatId = String(message.chat.id);
+  const text = message.text ?? '';
+  
+  // Record message (fast, synchronous)
+  await db.insertInto('telegram_messages').values({
+    chat_id: chatId,
+    message_id: message.message_id,
+    text,
+    received_at: new Date().toISOString(),
+  }).execute();
+
+  // Process intent (async, don't block webhook response)
+  processDriverIntent(chatId, text, db).catch((err) => {
+    log.error('intent processing failed', { chatId, err });
+  });
+  
+  // Respond immediately
+  return;
+}
+```
+
+---
+
+## ZIP Code Confirmations
+
+One clever use case: drivers confirm their location by sending a ZIP code to the bot.
+
+When a shipment is in transit, the bot periodically asks: "What ZIP code are you near right now?" Driver replies with `49000` (or whatever). The system:
+
+1. Logs the ZIP code update to `tg_zip_updates`
+2. Reverse-geocodes it to a city/region
+3. Updates the shipment's last-known location
+4. Pushes an SSE event to the admin dashboard
+
+This gave dispatchers real-time location awareness without GPS tracking, without a mobile app, without any special permissions. Drivers just... text back a ZIP code. It works.
+
+---
+
+## What I Got For Free
+
+By choosing Telegram over a custom mobile app:
+
+**No app distribution problem.** Zero Play Store submissions, zero APK hosting, zero "driver says they can't find the app" support tickets.
+
+**No authentication.** Telegram's chat ID is identity. Drivers don't need to log in, create accounts, or remember passwords.
+
+**No push notification setup.** Telegram handles delivery, retry, and notification badges. I don't deal with FCM, APNs, or device tokens.
+
+**Offline tolerance.** Telegram queues messages when drivers are in tunnels or low-connectivity areas. Messages arrive when they reconnect. My app doesn't need to handle any of this.
+
+**Free backend UI for me.** I can query any driver's status by sending them a message from the admin panel. During incidents, I can manually push messages to specific drivers without deploying anything.
+
+---
+
+## The Tradeoffs
+
+It's not perfect:
+
+**No rich UI.** Inline keyboards help, but you can't build complex interactions. Drivers can confirm, reject, and send ZIP codes — but more complex workflows need the web admin.
+
+**Telegram-dependent.** If Telegram goes down (rare, but it happens), driver notifications fail silently. I added a fallback SMS via an external provider for critical status changes.
+
+**Rate limits.** Telegram limits bots to ~30 messages/second. For most tenant sizes, this is fine. At scale, you'd need to queue and throttle.
+
+**Privacy expectations.** Drivers share their Telegram chat ID with the system. In Ukraine this is a non-issue — Telegram is already used for work extensively. In other markets this might be a friction point.
+
+---
+
+## Would I Do It Again?
+
+Absolutely. The Telegram bot went from "temporary hack" to a core feature that clients specifically mention when demoing the system to new customers. "Our drivers don't need to install anything — they just use Telegram" is a selling point.
+
+The lesson: don't build infrastructure that already exists. Telegram spent years solving mobile notification delivery, offline queuing, and cross-platform UX. I spent a weekend wiring up their API instead of 3 months building a mobile app.
+
+Sometimes the pragmatic solution is just... using the tool your users already have open on their phone.
+
+---
+
+*GoVantazh is a multi-tenant cargo management SaaS I'm building for Ukrainian freight companies. The tech stack is React 19, Hono, SQLite (per-tenant), and apparently now Telegram bots.*
