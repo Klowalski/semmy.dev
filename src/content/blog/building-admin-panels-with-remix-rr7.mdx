@@ -1,0 +1,306 @@
+---
+title: "Building Admin Panels with React Router v7: Patterns That Actually Work"
+description: "Full-stack admin CRUD with React Router v7 — loaders, actions, fetcher, route registration trap, delete confirmation, and pre-filled forms. Based on a real Ukrainian e-commerce store."
+pubDate: "2026-02-18"
+tags: ["react-router", "typescript", "fullstack", "admin", "crud"]
+---
+
+I just finished building the admin panel for a Ukrainian sock manufacturer's online store — products, categories, orders, payment proofs, Telegram notifications, Nova Poshta tracking. Here's what I learned about building CRUD admin interfaces with React Router v7 that actually hold up in production.
+
+## The Shape of a CRUD Admin Route
+
+React Router v7 gives you a clean separation between data and UI. A typical admin resource route has three exports:
+
+```typescript
+// 1. Loader: fetch data server-side
+export async function loader({ params }) {
+  const product = await getProductById(parseInt(params.id));
+  if (!product) throw new Response("Not found", { status: 404 });
+  return { product, categories: await getAllCategories() };
+}
+
+// 2. Action: handle form submissions
+export async function action({ request, params }) {
+  const formData = await request.formData();
+  const intent = formData.get("intent");
+  
+  if (intent === "delete") {
+    await deleteProduct(parseInt(params.id));
+    return redirect("/admin/products");
+  }
+  
+  await updateProduct(parseInt(params.id), parseFormData(formData));
+  return redirect("/admin/products");
+}
+
+// 3. Component: render the form
+export default function EditProduct({ loaderData, actionData }) {
+  // ...
+}
+```
+
+The `intent` pattern is the key insight: you can handle multiple actions (update, delete, toggle, etc.) from a single action function by checking a hidden `intent` field. No separate DELETE route needed.
+
+## The routes.ts Trap (Again)
+
+I keep hitting this one. In React Router v7 with `@react-router/fs-routes`, development auto-discovers routes from the filesystem. Production doesn't — it uses `routes.ts`.
+
+So when I added `admin.products.$id.edit.tsx`, it worked perfectly in dev. Would've 404'd in production until I registered it:
+
+```typescript
+// app/routes.ts
+export default [
+  route("admin/products", "routes/admin.products.tsx"),
+  route("admin/products/new", "routes/admin.products.new.tsx"),
+  route("admin/products/:id/edit", "routes/admin.products.$id.edit.tsx"), // ← MUST add this
+] satisfies RouteConfig;
+```
+
+The filename uses `$id` (dollar sign for params), but the route pattern uses `:id` (colon). Don't mix them up — RR7 will silently fail to match.
+
+**Rule of thumb:** Every time you create a new route file, immediately add it to `routes.ts`. Don't trust dev filesystem discovery.
+
+## Pre-filling Forms with defaultValue
+
+The killer feature of RR7 forms: `defaultValue` wires up server data with zero client state.
+
+```tsx
+<input
+  type="text"
+  name="name"
+  defaultValue={product.name}          // ← server data, no useState
+  className="..."
+/>
+
+<select
+  name="categoryId"
+  defaultValue={product.categoryId ?? ""}   // ← handle null
+>
+  <option value="">— no category —</option>
+  {categories.map(cat => (
+    <option key={cat.id} value={cat.id}>{cat.name}</option>
+  ))}
+</select>
+
+<input
+  type="checkbox"
+  name="isActive"
+  defaultChecked={product.isActive}    // ← boolean fields
+/>
+```
+
+The gotcha: checkboxes don't send a value when unchecked. So in your action:
+
+```typescript
+const isActive = formData.get("isActive") === "on"; // false when unchecked — correct!
+```
+
+Don't try to get `true`/`false` from a checkbox. It's either `"on"` or absent.
+
+## Multiple Forms on One Page
+
+The products edit page has two forms: the main update form, and a delete confirmation form. This is idiomatic RR7:
+
+```tsx
+{/* Main edit form */}
+<Form method="post">
+  <input type="hidden" name="intent" value="update" />
+  {/* ... fields ... */}
+  <button type="submit">Save changes</button>
+</Form>
+
+{/* Danger zone — separate Form element */}
+<Form
+  method="post"
+  onSubmit={(e) => {
+    if (!confirm(`Delete "${product.name}"? This cannot be undone.`)) {
+      e.preventDefault();
+    }
+  }}
+>
+  <button type="submit" name="intent" value="delete">
+    Delete product
+  </button>
+</Form>
+```
+
+The `name="intent" value="delete"` on the button itself sets the intent when that specific button is clicked — you don't need a hidden input. Buttons can submit form data.
+
+## useFetcher for Inline Edits
+
+Not everything needs a full page round-trip. For the stock count inline edit in the product list, I use `useFetcher`:
+
+```tsx
+function ProductRow({ product }) {
+  const fetcher = useFetcher();
+  
+  // Optimistic UI: show what we're submitting, not what's in the DB
+  const currentStock = fetcher.formData
+    ? parseInt(fetcher.formData.get("stock") as string, 10)
+    : product.stock;
+
+  return (
+    <fetcher.Form method="post" action="/admin/products">
+      <input type="hidden" name="intent" value="update-stock" />
+      <input type="hidden" name="productId" value={product.id} />
+      <input
+        type="number"
+        name="stock"
+        defaultValue={currentStock}
+        onBlur={(e) => fetcher.submit(e.target.form!)}
+        className="w-16 text-sm border rounded px-2 py-1"
+      />
+    </fetcher.Form>
+  );
+}
+```
+
+The `fetcher.formData` check gives you optimistic updates — the UI shows the new value immediately while the server request is in flight.
+
+## StaleData Problem with defaultValue
+
+Here's a subtle issue: `defaultValue` only sets the initial value. If the user submits and the action returns `{ error: "..." }` instead of redirecting, the form resets to the original server values, not what the user typed.
+
+RR7 gives you `actionData` for this. Pass it back and use it to restore the form state:
+
+```typescript
+// action.ts
+if (!name) {
+  return { error: "Name required", values: { name, slug, basePrice } };
+}
+```
+
+```tsx
+// component
+<input
+  type="text"
+  name="name"
+  defaultValue={actionData?.values?.name ?? product.name}
+/>
+```
+
+For simple admin tools where the user can just re-type, I skip this and just redirect on error with a flash message. But for complex forms, restore the user's input.
+
+## Type Safety for Loader + Action Data
+
+RR7 generates types when you run `pnpm react-router typegen`. Until you do that, you can type manually:
+
+```typescript
+type LoaderData = {
+  product: {
+    id: number;
+    name: string;
+    slug: string;
+    categoryId: number | null;
+    basePrice: number;
+    isActive: boolean;
+    // ...
+  };
+  categories: Array<{ id: number; name: string; slug: string }>;
+};
+
+type ActionData = {
+  error?: string;
+};
+
+export default function EditProduct({
+  loaderData,
+  actionData,
+}: {
+  loaderData: LoaderData;
+  actionData?: ActionData;    // ← optional! loader-only pages have no actionData
+}) {
+  // ...
+}
+```
+
+The `actionData` is `undefined` on initial page load — always make it optional.
+
+## The Delete Confirm Pattern
+
+Browser `confirm()` is synchronous and blocks the event loop. It works fine for admin panels where you control the audience. For the confirmation pattern:
+
+```tsx
+<Form
+  method="post"
+  onSubmit={(e) => {
+    if (!confirm(`Delete "${product.name}"? This cannot be undone.`)) {
+      e.preventDefault(); // ← cancel the form submission
+    }
+  }}
+>
+  <button type="submit" name="intent" value="delete">
+    <Trash2 className="w-4 h-4" />
+    Delete product
+  </button>
+</Form>
+```
+
+For public-facing UI, use a modal instead. But for internal admin tools, `confirm()` is perfectly fine and avoids modal state management entirely.
+
+## Loading States
+
+```tsx
+const navigation = useNavigation();
+const isSubmitting = navigation.state === "submitting";
+
+<button type="submit" disabled={isSubmitting}>
+  {isSubmitting ? "Saving..." : "Save changes"}
+</button>
+```
+
+One `useNavigation()` covers page-level form submissions. For inline fetcher-based edits, use `fetcher.state === "submitting"` instead.
+
+## The Admin Layout Pattern
+
+Wrap all admin routes in a layout route that handles authentication:
+
+```typescript
+// routes/admin.layout.tsx
+export async function loader({ request }) {
+  const session = await getAdminSession(request);
+  if (!session) return redirect("/admin/login");
+  return { admin: session };
+}
+
+export default function AdminLayout() {
+  return (
+    <div className="flex min-h-screen">
+      <AdminSidebar />
+      <main className="flex-1 p-6">
+        <Outlet />
+      </main>
+    </div>
+  );
+}
+```
+
+```typescript
+// routes.ts
+layout("routes/admin.layout.tsx", [
+  route("admin/dashboard", "routes/admin.dashboard.tsx"),
+  route("admin/products", "routes/admin.products.tsx"),
+  route("admin/products/new", "routes/admin.products.new.tsx"),
+  route("admin/products/:id/edit", "routes/admin.products.$id.edit.tsx"),
+  // ...
+]),
+```
+
+The layout's loader runs on every child route. One auth check, covers all admin pages.
+
+## What Actually Matters
+
+Building admin CRUD in RR7 is fast once you internalize:
+
+1. **Loader = data in, Action = data out** — pure server functions
+2. **`intent` pattern** — multiple actions per route, no extra routes
+3. **`defaultValue` for pre-filling** — no client state needed
+4. **`useFetcher` for inline edits** — optimistic UI without complexity
+5. **Register every route in `routes.ts`** — dev vs prod difference bites
+6. **`actionData` is optional** — undefined on GET
+
+The RR7 model is honestly cleaner than Redux + REST API admin panels I've built before. The data flow is obvious, the TypeScript types are inferrable, and you get full-stack TypeScript without a separate API layer.
+
+---
+
+*Built for [viatex.com.ua](https://viatex.com.ua) — a Ukrainian sock manufacturer's online store. Waiting for production deploy.*
