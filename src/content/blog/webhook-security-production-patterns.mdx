@@ -1,0 +1,442 @@
+---
+title: "Webhook Security: HMAC, Replay Attacks, and Idempotency in Production"
+description: "Building a production-grade webhook handler — signature verification, replay attack prevention, idempotency keys, and failure recovery. Real patterns from integrating Nova Poshta, LiqPay, and Telegram webhooks."
+pubDate: 2026-02-19
+tags: ["typescript", "security", "webhooks", "hono", "production"]
+---
+
+Webhooks look simple: receive a POST, do something, return 200. In production, they're one of the messier surfaces to get right. Here's everything that goes wrong and how to fix it.
+
+## The Basic Problem
+
+Your payment provider fires a webhook. Your server is briefly overloaded. The request times out. The provider retries — now you've charged the customer twice. Or you process it, return 500, and the provider gives up and never retries — now you've lost the payment notification entirely.
+
+Webhooks have three hard problems:
+1. **Authentication** — is this request really from who it claims to be?
+2. **Idempotency** — what happens if the same event arrives twice?
+3. **Reliability** — what happens if your handler crashes mid-processing?
+
+Let me walk through how I handle each of these in production.
+
+## HMAC Signature Verification
+
+Every serious webhook provider gives you a secret key and signs their requests. The signature is typically in a header like `X-Signature` or `X-Hub-Signature-256`.
+
+The raw bytes matter here — **always verify signatures against the raw request body**, not the parsed JSON. If you parse JSON first and re-serialize it, you might get different byte ordering, different whitespace, or different Unicode normalization. Always read raw.
+
+```typescript
+import { createHmac, timingSafeEqual } from "crypto";
+
+export async function verifySignature(
+  rawBody: Buffer,
+  signature: string,
+  secret: string
+): Promise<boolean> {
+  // Strip provider prefix if present (e.g., "sha256=...")
+  const sig = signature.startsWith("sha256=")
+    ? signature.slice(7)
+    : signature;
+
+  const expected = createHmac("sha256", secret)
+    .update(rawBody)
+    .digest("hex");
+
+  // CRITICAL: timing-safe comparison prevents timing attacks
+  try {
+    return timingSafeEqual(
+      Buffer.from(sig, "hex"),
+      Buffer.from(expected, "hex")
+    );
+  } catch {
+    // Different lengths throw — return false
+    return false;
+  }
+}
+```
+
+The `timingSafeEqual` is not optional. A naive `===` comparison exits early on the first mismatched byte — this leaks information about how many bytes of the signature are correct, which can be exploited to forge signatures over many requests. `timingSafeEqual` always takes the same amount of time regardless of where the mismatch is.
+
+### Reading Raw Body in Hono
+
+Hono's body parsers consume the stream. You need to read raw bytes *before* parsing:
+
+```typescript
+app.post("/webhook/liqpay", async (c) => {
+  // Read raw body as buffer
+  const rawBody = Buffer.from(await c.req.arrayBuffer());
+  
+  const signature = c.req.header("X-LiqPay-Signature") ?? "";
+  
+  const valid = await verifySignature(
+    rawBody,
+    signature,
+    env.LIQPAY_WEBHOOK_SECRET
+  );
+  
+  if (!valid) {
+    console.warn("Invalid webhook signature", {
+      ip: c.req.header("x-forwarded-for"),
+      ua: c.req.header("user-agent"),
+    });
+    // Return 200 to prevent retry storms from probing your endpoint
+    return c.json({ ok: false }, 200);
+  }
+  
+  // Now parse
+  const payload = JSON.parse(rawBody.toString("utf-8"));
+  await processPaymentWebhook(payload);
+  
+  return c.json({ ok: true });
+});
+```
+
+Note the 200 response on invalid signatures. Returning 401 or 403 tells an attacker they're sending the right shape but wrong signature. Returning 200 gives them nothing. There's debate on this — I lean toward 200 for external probing scenarios, but 401 is fine if your endpoint URL is already private.
+
+## Replay Attack Prevention
+
+HMAC verifies *who* sent the message, but not *when*. A replay attack captures a valid signed request and sends it again later. Payment webhooks are a common target.
+
+Most providers include a timestamp in the signed payload or headers. Stripe uses `t=<unix_timestamp>` in the `Stripe-Signature` header. You should reject requests older than a reasonable window — 5 minutes is standard:
+
+```typescript
+export function verifyTimestamp(
+  timestamp: number,
+  toleranceSeconds = 300 // 5 minutes
+): boolean {
+  const now = Math.floor(Date.now() / 1000);
+  return Math.abs(now - timestamp) <= toleranceSeconds;
+}
+```
+
+But timestamp checks alone aren't enough — someone can replay within the 5-minute window. The complete solution is **event ID deduplication**.
+
+## Idempotency via Event ID Deduplication
+
+Every webhook event should have a unique ID. LiqPay has `order_id`, Nova Poshta has their own identifiers, Telegram updates have `update_id`. Store processed IDs and reject duplicates:
+
+```typescript
+import { db } from "~/db";
+import { webhookEvents } from "~/db/schema";
+import { eq } from "drizzle-orm";
+
+export async function processWithIdempotency(
+  eventId: string,
+  provider: string,
+  handler: () => Promise<void>
+): Promise<{ alreadyProcessed: boolean }> {
+  // Try to insert the event ID — unique constraint catches duplicates
+  try {
+    await db.insert(webhookEvents).values({
+      eventId,
+      provider,
+      status: "processing",
+      receivedAt: new Date(),
+    });
+  } catch (err) {
+    // Unique constraint violation = already processed
+    if (isUniqueConstraintError(err)) {
+      console.log(`Duplicate webhook event: ${provider}/${eventId}`);
+      return { alreadyProcessed: true };
+    }
+    throw err;
+  }
+  
+  // Run the handler
+  try {
+    await handler();
+    
+    await db
+      .update(webhookEvents)
+      .set({ status: "processed", processedAt: new Date() })
+      .where(eq(webhookEvents.eventId, eventId));
+      
+    return { alreadyProcessed: false };
+  } catch (err) {
+    await db
+      .update(webhookEvents)
+      .set({ 
+        status: "failed", 
+        error: String(err),
+        failedAt: new Date() 
+      })
+      .where(eq(webhookEvents.eventId, eventId));
+    
+    throw err;
+  }
+}
+```
+
+The schema:
+
+```typescript
+export const webhookEvents = sqliteTable("webhook_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  eventId: text("event_id").notNull().unique(), // unique constraint is key
+  provider: text("provider").notNull(),
+  status: text("status", { 
+    enum: ["processing", "processed", "failed"] 
+  }).notNull(),
+  error: text("error"),
+  receivedAt: integer("received_at", { mode: "timestamp" }).notNull(),
+  processedAt: integer("processed_at", { mode: "timestamp" }),
+  failedAt: integer("failed_at", { mode: "timestamp" }),
+});
+```
+
+The unique constraint on `event_id` is doing the heavy lifting. Two concurrent requests for the same event ID will race to insert — one wins, one gets a unique constraint error. That's the idempotency guarantee.
+
+A full webhook handler looks like:
+
+```typescript
+app.post("/webhook/liqpay", async (c) => {
+  const rawBody = Buffer.from(await c.req.arrayBuffer());
+  const payload = JSON.parse(rawBody.toString("utf-8"));
+  
+  // 1. Verify signature
+  const signature = c.req.header("X-Signature") ?? "";
+  if (!await verifySignature(rawBody, signature, env.LIQPAY_SECRET)) {
+    return c.json({ ok: true }); // Silent reject
+  }
+  
+  // 2. Verify timestamp (if available)
+  if (!verifyTimestamp(payload.create_date / 1000)) {
+    console.warn("Stale webhook timestamp", { eventId: payload.order_id });
+    return c.json({ ok: true }); // Silent reject
+  }
+  
+  // 3. Idempotent processing
+  const { alreadyProcessed } = await processWithIdempotency(
+    payload.order_id,
+    "liqpay",
+    async () => {
+      if (payload.status === "success") {
+        await markOrderPaid(payload.order_id, payload.amount);
+        await sendOrderConfirmationEmail(payload.order_id);
+      }
+    }
+  );
+  
+  if (alreadyProcessed) {
+    return c.json({ ok: true, note: "already processed" });
+  }
+  
+  return c.json({ ok: true });
+});
+```
+
+## The Nova Poshta Status Polling Pattern
+
+Nova Poshta doesn't send webhooks — you poll their API for TTN status updates. This is actually more reliable in some ways (you control the timing, no missed events) but introduces different problems.
+
+The naive approach polls on every request. The smarter approach uses a background job that writes status updates to your DB, and your frontend reads from the DB:
+
+```typescript
+// runs every 15 minutes for active orders
+async function pollNovaPoshta() {
+  const activeOrders = await db
+    .select()
+    .from(orders)
+    .where(
+      and(
+        isNotNull(orders.ttnNumber),
+        notInArray(orders.deliveryStatus, ["delivered", "returned", "failed"])
+      )
+    );
+  
+  // Batch TTNs — NP supports up to 100 per request
+  const chunks = chunk(activeOrders, 100);
+  
+  for (const batch of chunks) {
+    const ttns = batch.map(o => o.ttnNumber!);
+    
+    const statuses = await novaPoshtaClient.tracking.getStatusDocuments({
+      Documents: ttns.map(ttn => ({ DocumentNumber: ttn })),
+    });
+    
+    for (const status of statuses) {
+      const order = batch.find(o => o.ttnNumber === status.Number);
+      if (!order) continue;
+      
+      const normalizedStatus = mapNPStatus(status.StatusCode);
+      
+      if (normalizedStatus !== order.deliveryStatus) {
+        await db
+          .update(orders)
+          .set({ 
+            deliveryStatus: normalizedStatus,
+            deliveryStatusUpdatedAt: new Date(),
+            deliveryStatusRaw: status.Status,
+          })
+          .where(eq(orders.id, order.id));
+        
+        // Notify customer on key transitions
+        if (normalizedStatus === "out_for_delivery" || normalizedStatus === "delivered") {
+          await sendDeliveryNotification(order, normalizedStatus);
+        }
+      }
+    }
+    
+    // Rate limit: NP asks for 1s between requests
+    await sleep(1000);
+  }
+}
+
+function mapNPStatus(statusCode: string): OrderDeliveryStatus {
+  const map: Record<string, OrderDeliveryStatus> = {
+    "1": "created",
+    "2": "in_transit",
+    "7": "out_for_delivery",
+    "9": "delivered",
+    "10": "returned",
+    "102": "failed",
+  };
+  return map[statusCode] ?? "unknown";
+}
+```
+
+The `deliveryStatusRaw` field is important — it stores Nova Poshta's actual status string. Their status codes change occasionally, and you want to see what they actually sent when debugging an unmapped code.
+
+## Failure Recovery
+
+Your webhook handler will crash eventually. When it does, you want the provider to retry (they usually do — Stripe retries up to 3 days, most providers retry several times). The key is:
+
+**Return 200 only after you're sure the work is done, or if you know it's a duplicate.**
+**Return 500 (or let the error propagate) if you want a retry.**
+
+But retries create the idempotency problem. The deduplication table handles this — if your handler crashes after the DB write but before the status update, the next retry will try to insert the same event_id, hit the unique constraint, and... think it was already processed.
+
+The fix is the `processing` status. On retry, check for stale `processing` records:
+
+```typescript
+export async function processWithIdempotency(
+  eventId: string,
+  provider: string,
+  handler: () => Promise<void>
+): Promise<{ alreadyProcessed: boolean }> {
+  const existing = await db
+    .select()
+    .from(webhookEvents)
+    .where(eq(webhookEvents.eventId, eventId))
+    .get();
+  
+  if (existing) {
+    if (existing.status === "processed") {
+      return { alreadyProcessed: true };
+    }
+    
+    if (existing.status === "failed") {
+      // Allow retry of failed events
+      await db
+        .update(webhookEvents)
+        .set({ status: "processing", error: null, failedAt: null })
+        .where(eq(webhookEvents.eventId, eventId));
+    }
+    
+    if (existing.status === "processing") {
+      // Check if it's stale (> 10 minutes old = previous crash)
+      const staleCutoff = new Date(Date.now() - 10 * 60 * 1000);
+      if (existing.receivedAt < staleCutoff) {
+        // Stale processing record — allow retry
+        await db
+          .update(webhookEvents)
+          .set({ status: "processing" })
+          .where(eq(webhookEvents.eventId, eventId));
+      } else {
+        // Recently started processing — might be concurrent, wait
+        return { alreadyProcessed: true };
+      }
+    }
+  } else {
+    await db.insert(webhookEvents).values({
+      eventId,
+      provider,
+      status: "processing",
+      receivedAt: new Date(),
+    });
+  }
+  
+  // ... run handler ...
+}
+```
+
+This handles the main failure modes:
+- **Duplicate delivery** → `status: "processed"` → return 200 immediately
+- **Processing crash** → `status: "processing"`, stale → retry allowed
+- **Handler error** → `status: "failed"` → retry allowed on next delivery
+
+## Telegram Webhooks
+
+Telegram is a special case — their webhooks have a different shape and their retry logic is aggressive (they retry every second for 60 seconds if they don't get a 200).
+
+The key Telegram quirk: `update_id` is a monotonically increasing integer per bot. If you receive `update_id: 1000` and then `update_id: 999`, the second one is a replay. Telegram expects you to call `getUpdates` with `offset: last_update_id + 1` to acknowledge processed updates — but in webhook mode, you just return 200.
+
+Use the same deduplication table with `update_id.toString()` as the event ID. And process fast — if your handler takes > 10s, Telegram retries while you're still processing:
+
+```typescript
+app.post("/webhook/telegram", async (c) => {
+  const update = await c.req.json<TelegramUpdate>();
+  
+  // Return 200 immediately, process async
+  c.executionCtx?.waitUntil(
+    processWithIdempotency(
+      update.update_id.toString(),
+      "telegram",
+      () => handleTelegramUpdate(update)
+    ).catch(err => console.error("Telegram update processing failed", err))
+  );
+  
+  return c.json({ ok: true });
+});
+```
+
+The `waitUntil` pattern (Cloudflare Workers / Hono with CF adapter) lets you return 200 immediately while the handler runs in the background. For traditional Node.js, you can fire-and-forget with proper error handling — just don't `await` the handler in the request path.
+
+## What I Skip in Development
+
+In local development, I skip signature verification entirely:
+
+```typescript
+const SKIP_WEBHOOK_VERIFY = process.env.NODE_ENV === "development";
+
+if (!SKIP_WEBHOOK_VERIFY) {
+  if (!await verifySignature(rawBody, signature, secret)) {
+    return c.json({ ok: true });
+  }
+}
+```
+
+And for testing, I have a development-only endpoint that lets me manually fire webhook payloads:
+
+```typescript
+if (process.env.NODE_ENV === "development") {
+  app.post("/dev/simulate-webhook/:provider", async (c) => {
+    const { provider } = c.req.param();
+    const payload = await c.req.json();
+    
+    await processPaymentWebhook(provider, payload);
+    
+    return c.json({ ok: true });
+  });
+}
+```
+
+Never in production. But in development, being able to POST a synthetic LiqPay payload directly is invaluable for testing order status flows without going through actual payment.
+
+## The Webhook Events Table is Your Audit Log
+
+Don't think of the deduplication table as just infrastructure. It's your audit trail for every external event your system has processed. You'll want it when a customer says "I paid but the order isn't confirmed" — you can query `webhook_events` to see if the payment notification arrived, if it was processed, and if there was an error.
+
+Add a `raw_payload` column to store the full request body. Storage is cheap, debugging is not:
+
+```typescript
+export const webhookEvents = sqliteTable("webhook_events", {
+  // ... other columns ...
+  rawPayload: text("raw_payload"), // JSON blob of the full webhook body
+});
+```
+
+When something goes wrong at 2 AM and a client is calling, you'll thank yourself for keeping it.
+
+---
+
+The common thread: webhooks are simple to receive and hard to receive *correctly*. The two-line "receive and process" approach works until you have a busy week, a retry storm, or a replay attack — and then it's not 2 AM debugging, it's 2 AM money problems. Build the idempotency table on day one.
