@@ -1,0 +1,326 @@
+---
+title: "Drizzle ORM in Production: Patterns That Actually Work"
+description: "Real patterns from running Drizzle ORM in production — schema design, query composition, transaction patterns, and pitfalls I hit so you don't have to."
+pubDate: 2026-02-19
+tags: ["drizzle", "sqlite", "typescript", "backend", "orm"]
+---
+
+import { Code } from 'astro:components';
+
+I've been running Drizzle ORM in production for about six months across two projects — a multi-tenant logistics SaaS and a Ukrainian e-commerce platform. Here's what I've learned past the "getting started" tutorials.
+
+## Why Drizzle
+
+First, the honest pitch: Drizzle is not the most ergonomic ORM. The query builder can be verbose. The docs have gaps. The ecosystem is young.
+
+But it has one killer property: **you're always close to the SQL**. When something goes wrong at 2 AM, I can read a Drizzle query and know exactly what it generates. I can paste the SQL into a DB browser and test it. There's no magic layer between me and the database.
+
+For SQLite specifically, this matters even more. SQLite has quirks — no native `RETURNING` support in older versions, no `LIMIT` in UPDATE statements, JSON handling differences. Drizzle surfaces these instead of hiding them with leaky abstractions.
+
+## Schema Design: Be Explicit
+
+Drizzle's schema is TypeScript first. The schema file is your source of truth for both types and migrations.
+
+```typescript
+// db/schema.ts
+import { sqliteTable, text, integer, real } from 'drizzle-orm/sqlite-core';
+
+export const products = sqliteTable('products', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  slug: text('slug').notNull().unique(),
+  name: text('name').notNull(),
+  description: text('description'),
+  price: real('price').notNull(),
+  priceUsd: real('price_usd'),
+  categoryId: integer('category_id').references(() => categories.id),
+  isActive: integer('is_active', { mode: 'boolean' }).notNull().default(true),
+  createdAt: integer('created_at', { mode: 'timestamp' })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+export const categories = sqliteTable('categories', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  slug: text('slug').notNull().unique(),
+  name: text('name').notNull(),
+  parentId: integer('parent_id').references((): any => categories.id),
+});
+```
+
+A few things worth noting:
+
+**Booleans are integers in SQLite.** Drizzle handles the coercion with `{ mode: 'boolean' }`, but the underlying column is 0/1. If you query the DB directly, remember this.
+
+**Timestamps are also integers.** SQLite has no native `DATETIME` type that works well with JavaScript. Store as Unix timestamp (integer) with `{ mode: 'timestamp' }` and Drizzle gives you `Date` objects automatically.
+
+**Self-referential foreign keys need `: any`** to avoid TypeScript circular reference errors. It's ugly, but it's the current workaround.
+
+**`$defaultFn` for computed defaults.** Don't use SQL defaults (`defaultNow()`) if you need the timestamp available immediately in your TypeScript code after insert — SQL defaults only come back on `RETURNING` queries. `$defaultFn` sets the value in JavaScript before the insert, so it's always available.
+
+## Type Inference: The Drizzle Superpower
+
+```typescript
+import { InferSelectModel, InferInsertModel } from 'drizzle-orm';
+
+export type Product = InferSelectModel<typeof products>;
+export type NewProduct = InferInsertModel<typeof products>;
+
+// Now you get typed query results automatically:
+const product: Product = await db.query.products.findFirst({
+  where: eq(products.slug, 'some-slug'),
+});
+```
+
+Don't define your own interfaces. Let Drizzle infer them from the schema. This keeps types in sync with the actual database shape without any manual maintenance.
+
+For partial types (when you only select certain columns), use the `typeof query.$inferType` pattern or just type the variable explicitly:
+
+```typescript
+const slim = await db
+  .select({ id: products.id, name: products.name, price: products.price })
+  .from(products)
+  .where(eq(products.isActive, true));
+
+type SlimProduct = typeof slim[number];
+// { id: number; name: string; price: number }
+```
+
+## Query Patterns
+
+### The Repository Pattern (Sort Of)
+
+I don't use a full repository pattern, but I do group related queries into query files:
+
+```typescript
+// db/queries/products.ts
+import { db } from '../client';
+import { products, categories } from '../schema';
+import { eq, like, and, desc } from 'drizzle-orm';
+
+export async function getProductBySlug(slug: string) {
+  return db.query.products.findFirst({
+    where: eq(products.slug, slug),
+    with: {
+      category: true,
+    },
+  });
+}
+
+export async function searchProducts(query: string, categorySlug?: string) {
+  const conditions = [
+    eq(products.isActive, true),
+    like(products.name, `%${query}%`),
+  ];
+
+  if (categorySlug) {
+    conditions.push(
+      eq(
+        products.categoryId,
+        db
+          .select({ id: categories.id })
+          .from(categories)
+          .where(eq(categories.slug, categorySlug))
+      )
+    );
+  }
+
+  return db
+    .select()
+    .from(products)
+    .where(and(...conditions))
+    .orderBy(desc(products.createdAt))
+    .limit(50);
+}
+```
+
+This gives you reusable, testable query functions without the overhead of a full ORM pattern.
+
+### Relations: The Relational API vs Joins
+
+Drizzle has two query styles: the **relational API** (`db.query.X.findMany`) and the **core API** (`db.select().from()`). Use them for different things.
+
+**Relational API** — when you want nested objects:
+```typescript
+const product = await db.query.products.findFirst({
+  where: eq(products.slug, slug),
+  with: {
+    category: true,
+    variants: {
+      where: eq(productVariants.isAvailable, true),
+      orderBy: asc(productVariants.price),
+    },
+  },
+});
+// product.category is a Category, product.variants is Variant[]
+```
+
+**Core API** — when you need fine-grained control or aggregations:
+```typescript
+const result = await db
+  .select({
+    product: products,
+    categoryName: categories.name,
+    variantCount: count(productVariants.id),
+  })
+  .from(products)
+  .leftJoin(categories, eq(products.categoryId, categories.id))
+  .leftJoin(productVariants, eq(productVariants.productId, products.id))
+  .groupBy(products.id, categories.name)
+  .where(eq(products.isActive, true));
+```
+
+The relational API generates multiple queries under the hood (not a JOIN). For list views with pagination, this can be slower than a single JOIN. The core API generates exactly the SQL you specify.
+
+**My rule:** Use the relational API for single-record detail pages. Use the core API for list views, reports, and anything that needs aggregation.
+
+## Transactions: Critical for Data Integrity
+
+SQLite is single-writer, so transactions are especially important — a failed mid-operation can leave your data in a bad state.
+
+```typescript
+async function createProductWithVariants(
+  productData: NewProduct,
+  variants: NewProductVariant[]
+) {
+  return db.transaction(async (tx) => {
+    const [product] = await tx
+      .insert(products)
+      .values(productData)
+      .returning();
+
+    if (variants.length > 0) {
+      await tx.insert(productVariants).values(
+        variants.map((v) => ({ ...v, productId: product.id }))
+      );
+    }
+
+    return product;
+  });
+}
+```
+
+If `insert(productVariants)` fails, the whole transaction rolls back. No orphaned products, no partial state.
+
+**Error handling in transactions:**
+```typescript
+try {
+  await db.transaction(async (tx) => {
+    // ... operations
+    // Throw to trigger rollback:
+    if (!validationPasses) {
+      throw new Error('Validation failed');
+    }
+  });
+} catch (e) {
+  // Transaction was rolled back
+  console.error('Transaction failed:', e);
+}
+```
+
+Any thrown error inside `db.transaction()` rolls back the transaction. You don't need to call `tx.rollback()` manually.
+
+## Migrations in Production
+
+I covered this in detail in [another post](/blog/drizzle-sqlite-production-migrations), but the short version for multi-container environments:
+
+**Never use `migrate()` in the app server** if you have multiple replicas. Use a dedicated migration container:
+
+```dockerfile
+# In your docker-compose.yml
+services:
+  migrate:
+    image: your-app
+    command: node -e "import('./db/migrate.js').then(m => m.runMigrations())"
+    depends_on:
+      - app
+    restart: "no"  # Run once and exit
+```
+
+For SQLite with bind-mounted volumes, the migration needs to run against the same file the app uses. Make sure the paths match between services.
+
+## The Pitfalls
+
+### 1. `returning()` is SQLite 3.35+
+
+If you're deploying to a system with an old SQLite version (looking at you, Debian 11), `.returning()` will fail silently or throw. Check your SQLite version:
+
+```bash
+sqlite3 --version
+# You need 3.35.0+ for RETURNING support
+```
+
+In Dockerfile, use a recent base image:
+```dockerfile
+FROM node:20-alpine  # Alpine 3.18+ includes SQLite 3.41
+```
+
+If you can't control the SQLite version, avoid `.returning()` and do a separate `SELECT` after `INSERT`.
+
+### 2. SQLite Concurrent Writes
+
+SQLite allows one writer at a time. In production, this means:
+
+- **WAL mode is mandatory** for any concurrent access: `PRAGMA journal_mode=WAL`
+- **Set it at connection time**, not as a migration
+- Set busy timeout: `PRAGMA busy_timeout=5000` (5 seconds)
+
+```typescript
+// db/client.ts
+import Database from 'better-sqlite3';
+import { drizzle } from 'drizzle-orm/better-sqlite3';
+
+const sqlite = new Database(process.env.DB_PATH!);
+sqlite.pragma('journal_mode = WAL');
+sqlite.pragma('busy_timeout = 5000');
+sqlite.pragma('foreign_keys = ON');
+
+export const db = drizzle(sqlite, { schema });
+```
+
+This is the minimal production configuration. Without WAL mode, concurrent reads block writes and vice versa.
+
+### 3. Column Name Mismatches
+
+Drizzle uses camelCase in TypeScript but snake_case in SQL. The mapping is explicit in the schema:
+
+```typescript
+isActive: integer('is_active', { mode: 'boolean' })
+```
+
+If you rename a TypeScript field without updating the SQL column name string, you'll get a runtime error, not a TypeScript error. Drizzle Studio can help catch this, but it's a common source of bugs.
+
+### 4. The `with` Relation Config Is Required
+
+If you use the relational API (`db.query.X.findMany({ with: { relation: true } })`), you must define relations in your schema:
+
+```typescript
+// db/schema.ts — add this after defining tables
+export const productsRelations = relations(products, ({ one, many }) => ({
+  category: one(categories, {
+    fields: [products.categoryId],
+    references: [categories.id],
+  }),
+  variants: many(productVariants),
+}));
+```
+
+Without this, `with` will throw at runtime. It's not caught at compile time because the relations are registered at runtime. Always define your relations when you define your tables.
+
+## What I'd Do Differently
+
+If I were starting over:
+
+1. **Define relations immediately** — don't wait until you need the relational API
+2. **Use `$defaultFn` for all timestamps** — avoid SQL defaults
+3. **WAL mode in client setup, not migrations** — it needs to apply every connection
+4. **Separate query files early** — collocating queries with route handlers works until it doesn't
+5. **Type your queries aggressively** — `const result: Product[]` on query results catches shape mismatches early
+
+Drizzle is not perfect, but for SQLite in production TypeScript apps, it's currently the best option I've found. The SQL proximity is worth the verbosity.
+
+---
+
+*Running Drizzle in production? I'm happy to compare notes. Find me on GitHub as [Klowalski](https://github.com/Klowalski) or check the [ecomlanding](https://github.com/SeMmyT/ecomlanding) repo for real-world usage.*
