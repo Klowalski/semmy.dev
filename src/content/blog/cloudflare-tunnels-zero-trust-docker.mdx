@@ -1,0 +1,249 @@
+---
+title: "Cloudflare Tunnels: How I Exposed Docker Services Without Opening a Single Port"
+description: "No NAT, no firewall rules, no static IP required. How cloudflared tunnels became the infrastructure backbone of GoVantazh — and why I'll use them on every project now."
+pubDate: 2026-02-19
+tags: ["cloudflare", "docker", "devops", "infrastructure", "security", "ukraine"]
+---
+
+When I started deploying GoVantazh — a logistics SaaS serving multiple Ukrainian freight companies — I had a familiar infrastructure problem: how do I expose services to the internet without opening ports, managing firewall rules, or paying for static IPs?
+
+The answer was Cloudflare Tunnels. And it changed how I think about every deployment.
+
+---
+
+## The Old Way Was Terrible
+
+Before tunnels, exposing a Docker service looked like this:
+
+1. Configure your VPS firewall to allow 80 and 443
+2. Point your domain DNS to your server's IP
+3. Set up Nginx as a reverse proxy with SSL
+4. Manage Let's Encrypt certs (and their renewal)
+5. Repeat for every service, every environment
+
+For a hobby project, fine. For a SaaS with multiple tenants, this gets painful fast. You also now have publicly exposed ports, which means:
+
+- Port scanners find you immediately
+- Bots try common exploits 24/7
+- You're responsible for keeping Nginx patched
+- Your cert renewal is one missed renewal from outage
+
+GoVantazh has a core API, a per-tenant worker system, and admin tooling. All of it needed to be accessible — some of it externally, some of it only internally. Cloudflare Tunnels handled all of this.
+
+---
+
+## What Cloudflare Tunnels Actually Do
+
+A Cloudflare Tunnel (`cloudflared`) is an outbound-only connection from your server to Cloudflare's edge. Your server initiates the connection; nothing needs to reach inward.
+
+The architecture looks like this:
+
+```
+Internet → Cloudflare Edge → cloudflared daemon → your Docker service
+                               (outbound only)
+```
+
+No open ports. No firewall exceptions. No exposed IPs. Cloudflare's global network handles TLS termination, DDoS protection, and routing. You just run a daemon that connects out.
+
+The tunnel is defined by a single config file and a credential JSON that Cloudflare issues when you create the tunnel. No IP addresses involved.
+
+---
+
+## GoVantazh's Tunnel Setup
+
+Here's the actual structure I use in GoVantazh:
+
+```yaml
+# infra/docker/docker-compose.core.yml
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yml run
+    volumes:
+      - ./cloudflared:/etc/cloudflared:ro
+    networks:
+      - govantazh-internal
+    depends_on:
+      - govantazh-api
+```
+
+The tunnel config:
+
+```yaml
+# infra/docker/cloudflared/config.yml
+tunnel: <tunnel-id>
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: api.govantazh.com
+    service: http://govantazh-api:3000
+
+  - hostname: "*.govantazh.com"
+    service: http://govantazh-api:3000
+
+  - service: http_status:404
+```
+
+That last catch-all is required — cloudflared rejects configs without it.
+
+The credentials file (`credentials.json`) is the one sensitive piece. It's generated once when you create the tunnel:
+
+```bash
+cloudflared tunnel create govantazh
+# Creates ~/.cloudflared/<tunnel-id>.json
+```
+
+I store this in a secrets directory and bind-mount it. Never commit it.
+
+---
+
+## DNS: Automatic via Cloudflare API
+
+One of the nicest parts: you don't manage DNS manually. Cloudflare creates `CNAME` records pointing to your tunnel automatically:
+
+```bash
+cloudflared tunnel route dns govantazh api.govantazh.com
+cloudflared tunnel route dns govantazh "*.govantazh.com"
+```
+
+Run this once per hostname. The CNAME points to `<tunnel-id>.cfargotunnel.com`. Cloudflare resolves it internally — nothing public touches your server IP.
+
+---
+
+## Per-Tenant Routing
+
+GoVantazh is multi-tenant. Each freight company gets a subdomain: `proexpedite.govantazh.com`, `maxcargo.govantazh.com`, etc.
+
+The wildcard `*.govantazh.com` route in the config sends all subdomains to the same API, which reads the `Host` header to determine which tenant to serve:
+
+```typescript
+// apps/api/src/middleware/tenant.ts
+import type { Context } from "hono";
+
+export async function tenantMiddleware(c: Context, next: () => Promise<void>) {
+  const host = c.req.header("host") ?? "";
+  const subdomain = host.split(".")[0];
+
+  if (!subdomain || subdomain === "api" || subdomain === "www") {
+    return c.json({ error: "No tenant context" }, 400);
+  }
+
+  const tenant = await resolveTenant(subdomain);
+  if (!tenant) {
+    return c.json({ error: "Unknown tenant" }, 404);
+  }
+
+  c.set("tenant", tenant);
+  await next();
+}
+```
+
+Cloudflare Tunnels pass the original `Host` header through cleanly — no extra configuration needed.
+
+---
+
+## Internal Services: Never Exposed
+
+Some services should be internal-only. The per-tenant workers (CRTG readers, mail daemons, sysreaders) don't need public access — they communicate with the API via Docker's internal network.
+
+The beauty of tunnels here: because nothing is port-forwarded at the system level, internal services are truly internal. There's no accidental exposure. If a service isn't in the tunnel config, it's not reachable from outside. Full stop.
+
+This is harder to guarantee with traditional Nginx setups, where a misconfigured `location` block or a missing `deny all` can accidentally expose internal routes.
+
+---
+
+## Zero Trust Access (Optional but Useful)
+
+Cloudflare Access integrates directly with tunnels. For admin routes, I lock them behind SSO:
+
+```yaml
+# ingress rule for admin
+- hostname: admin.govantazh.com
+  service: http://govantazh-api:3000
+  originRequest:
+    access:
+      required: true
+      teamName: govantazh
+```
+
+Cloudflare Access handles authentication via GitHub, Google, or email OTP. The request only reaches your origin if the user is authenticated. Your API sees a `Cf-Access-Jwt-Assertion` header you can verify if you want a second layer.
+
+For GoVantazh this means: admin routes are behind Cloudflare Access, client-facing routes are public. No VPN, no bastion host.
+
+---
+
+## What Breaks (And How to Fix It)
+
+**WebSocket connections** need an extra header hint in some cases. For Hono's SSE and WebSocket routes, make sure your tunnel config doesn't interfere:
+
+```yaml
+ingress:
+  - hostname: api.govantazh.com
+    service: http://govantazh-api:3000
+    originRequest:
+      noTLSVerify: false
+      # SSE works fine; WS needs explicit tunnel protocol
+```
+
+Actually, for SSE (which GoVantazh uses for real-time updates), tunnels work perfectly out of the box. WebSockets also work, but set `--http2-origin` in your cloudflared command if you hit issues with long-lived connections getting dropped.
+
+**Large file uploads** can hit Cloudflare's default request size limits (100MB on free, 500MB on Business). If your app handles file uploads (GoVantazh takes payment proof images), set appropriate limits or use direct uploads to R2/S3 instead of routing through the tunnel.
+
+**Health check endpoints** need to be aware that Cloudflare may probe them. Add a simple `/health` route that returns 200 and you'll avoid false alarms in uptime monitoring.
+
+---
+
+## The Setup Takes 15 Minutes
+
+1. Create a Cloudflare account and add your domain (it becomes your nameserver)
+2. `cloudflared tunnel create <name>` — generates credentials
+3. Write a config.yml with your ingress rules
+4. Add the cloudflared container to your docker-compose
+5. `cloudflared tunnel route dns <name> <hostname>` for each hostname
+6. `docker compose up -d`
+
+That's it. No Nginx. No Let's Encrypt setup. No firewall rules. Cloudflare's network handles the TLS, the caching, the DDoS mitigation.
+
+The first time I had a production HTTPS service running in under 10 minutes with no cert management, I had to sit with it for a moment. It felt like cheating.
+
+---
+
+## vs Nginx Proxy Manager / Traefik
+
+I've used both. Comparison:
+
+| | Cloudflare Tunnels | Traefik | Nginx Proxy Manager |
+|---|---|---|---|
+| Port exposure | None | 80/443 | 80/443 |
+| TLS management | Cloudflare | Let's Encrypt | Let's Encrypt |
+| Config complexity | Low | Medium | Low |
+| DDoS protection | Built-in | None | None |
+| Cost | Free (tunnel) | Free | Free |
+| Self-hosted | No | Yes | Yes |
+
+The main argument against tunnels: you're dependent on Cloudflare. Your traffic goes through their network. For most applications, this is a feature (DDoS protection, global CDN) not a concern. For applications with strict data residency requirements, you'd evaluate differently.
+
+For GoVantazh — a Ukrainian SaaS — having Cloudflare's network absorb any DDoS attempts is specifically valuable. The threat landscape in Ukraine is not theoretical.
+
+---
+
+## What I'd Change
+
+The one thing I'd do differently: **use Cloudflare's API to manage tunnel routes programmatically** instead of running `cloudflared route dns` manually. For a SaaS that provisions tenant subdomains dynamically, you want to call the API when a new tenant is created, not SSH into a server and run a CLI command.
+
+Cloudflare's API is well-documented and there's an official Node.js SDK. On my list for GoVantazh v2.
+
+---
+
+## The Bottom Line
+
+Cloudflare Tunnels are now my default for any project that needs HTTPS services. The zero-open-ports model is simply better for security. The automatic TLS is better for reliability. The DDoS protection is better for anything facing the public internet.
+
+And it's free for what I'm using.
+
+If you're still running Nginx reverse proxies with Let's Encrypt, try tunnels on your next project. You probably won't go back.
+
+---
+
+*GoVantazh is a logistics SaaS I've been building — multi-tenant, Hono + SQLite, deployed on Hetzner via Cloudflare Tunnels. More posts in this series: [per-tenant SQLite](/blog/sqlite-per-tenant-isolation), [SSE real-time](/blog/sse-real-time-without-websockets), [Turborepo monorepo](/blog/turborepo-monorepo-logistics-saas).*
