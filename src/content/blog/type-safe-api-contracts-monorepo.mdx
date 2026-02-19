@@ -1,0 +1,297 @@
+---
+title: "Type-Safe API Contracts in a Turborepo Monorepo"
+description: "How to share types between a Hono API and React Router v7 frontend without code generation, runtime schemas, or prayer. Real patterns from govantazh."
+pubDate: 2026-02-19
+tags: ["TypeScript", "Turborepo", "Hono", "monorepo", "API design", "type safety"]
+---
+
+The classic monorepo promise: share code between packages. The classic monorepo failure: you end up copy-pasting types between `packages/api` and `packages/web` and calling it "good enough."
+
+I've done it both ways. Here's what actually works.
+
+## The Problem: Two Separate Type Worlds
+
+In a frontend + backend monorepo, you have two TypeScript programs that communicate over HTTP. Neither knows what the other is doing — unless you make them share types explicitly.
+
+The failure modes:
+
+- Backend returns `{ status: "active" }`, frontend expects `{ status: "enabled" }`. Works fine until it doesn't.
+- Backend changes a field from `number` to `string`. TypeScript catches nothing because the types live in separate files that nobody updated.
+- A new developer adds a field to the API response. Forgets to update the frontend type. Six months later, someone wonders why a feature works in staging but breaks in production.
+
+This is the **dual-typing problem**: your API is typed twice, independently, with no enforcement that they match.
+
+## The Solution: `packages/shared`
+
+In govantazh (a logistics SaaS), we have a `@govantazh/shared` package that both the API (`packages/api`) and the frontend (`packages/web`) import from.
+
+```
+packages/
+  api/         # Hono server
+  db/          # Drizzle schema + database layer
+  shared/      # Types, constants, validators — the contract
+  web/         # React Router v7 frontend
+```
+
+The shared package has one job: define the contract between the two programs. It exports:
+
+1. **Entity types** — what a `Cargo`, `Driver`, `Bid` looks like
+2. **API types** — request/response shapes, SSE message format, pagination wrapper
+3. **Constants** — values both sides need (`CARGO_PAGE_SIZE`, `BID_STATUSES`, etc.)
+
+Neither the API nor the web package defines any domain type locally. If you need to know what a `Cargo` looks like, you import it from `@govantazh/shared`.
+
+## What Goes in Shared
+
+### Entity types
+
+```typescript
+// packages/shared/src/types/index.ts
+export interface Cargo {
+  id: string;
+  broker_name: string;
+  weight_kg: number | null;
+  origin_city: string;
+  destination_city: string;
+  posted_at: string | null;
+  expires_at: string | null;
+  // ...
+}
+
+export interface Driver {
+  id: string;
+  full_name: string;
+  phone: string;
+  truck_type: TruckType;
+  availability: boolean;
+  // ...
+}
+```
+
+These are the canonical shapes. The database layer may have slightly different names (snake_case vs camelCase), but shared defines what the API promises to deliver.
+
+### API response wrappers
+
+```typescript
+// packages/shared/src/types/api.ts
+
+export interface PaginatedResponse<T> {
+  data: T[];
+  page: number;
+  limit: number;
+  hasMore: boolean;
+  lastDocId?: string;
+  isRealTime: boolean;
+}
+
+export interface ApiError {
+  error: string;
+  message: string;
+  statusCode: number;
+}
+```
+
+Now when the API returns a paginated cargo list, it returns `PaginatedResponse<Cargo>`. When the frontend fetches it, it types the result as `PaginatedResponse<Cargo>`. Same import. Same type. No drift.
+
+### SSE message format
+
+```typescript
+export type SSEChannelName =
+  | 'drivers'
+  | 'cargos'
+  | 'bids'
+  | 'admin-notifications';
+
+export interface SSEMessage<T = unknown> {
+  channel: SSEChannelName;
+  action: 'create' | 'update' | 'delete';
+  data: T;
+  timestamp: string;
+}
+```
+
+SSE is particularly prone to type drift because you can't easily verify the shape at runtime. Sharing the `SSEMessage` type means both the Hono SSE handler and the frontend EventSource listener agree on exactly what's coming over the wire.
+
+### Constants
+
+```typescript
+// packages/shared/src/constants.ts
+export const CARGO_PAGE_SIZE = 50;
+export const BID_STATUSES = ['pending', 'accepted', 'rejected', 'cancelled'] as const;
+export type BidStatus = typeof BID_STATUSES[number];
+
+export const TRUCK_TYPES = ['tent', 'ref', 'flatbed', 'container'] as const;
+export type TruckType = typeof TRUCK_TYPES[number];
+```
+
+Constants that belong to both sides — don't duplicate them. If you change `CARGO_PAGE_SIZE` from 50 to 100, it changes everywhere.
+
+## Transform Layer: DB → API Shape
+
+The database schema rarely matches the API shape exactly. You need a transform layer.
+
+```typescript
+// packages/api/src/lib/transforms.ts
+import type { Cargo, CargoMatchingDriver } from '@govantazh/shared';
+
+export function cargoToApi(
+  row: DbCargo,
+  matchingDrivers: DbCargoMatchingDriver[]
+): Cargo {
+  return {
+    id: row.id,
+    broker_name: row.broker_name,
+    weight_kg: row.weight_kg,
+    origin_city: row.origin_city,
+    destination_city: row.destination_city,
+    posted_at: row.posted_at,
+    expires_at: row.expires_at,
+    matchingDrivers: matchingDrivers.map(d => ({
+      driver_id: d.driver_id,
+      score: d.score,
+    })),
+  };
+}
+```
+
+The return type is explicitly `Cargo` from `@govantazh/shared`. If the shared type changes (new required field, renamed field), TypeScript will error here. The transform function is the enforcement point.
+
+This matters because:
+- Your DB schema uses snake_case, your API might want camelCase, your shared type is the canonical answer
+- You might compute derived fields (`matchingDrivers` doesn't come from the cargos table)
+- You can add/remove fields from the DB without breaking the API contract, as long as the transform handles it
+
+## Consuming in the Frontend
+
+On the web side:
+
+```typescript
+// packages/web/src/lib/api.ts
+import type { Cargo, PaginatedResponse } from '@govantazh/shared';
+
+async function fetchCargos(page: number): Promise<PaginatedResponse<Cargo>> {
+  const response = await fetch(`/api/cargos?page=${page}`);
+  if (!response.ok) throw new Error('Failed to fetch cargos');
+  return response.json() as Promise<PaginatedResponse<Cargo>>;
+}
+```
+
+Note the `as Promise<PaginatedResponse<Cargo>>`. This is a type assertion — TypeScript can't verify the runtime shape. That's a real limitation. But it's far better than typing the response as `any` or inferring it from an untyped `fetch`.
+
+For the SSE handler:
+
+```typescript
+// packages/web/src/lib/sse.ts
+import type { SSEMessage, Cargo, Driver } from '@govantazh/shared';
+
+const source = new EventSource('/api/sse');
+
+source.addEventListener('message', (event) => {
+  const msg = JSON.parse(event.data) as SSEMessage;
+
+  if (msg.channel === 'cargos') {
+    const cargo = msg.data as Cargo;
+    // handle cargo update
+  }
+});
+```
+
+The channel name is a `SSEChannelName` literal union from shared. TypeScript will tell you if you typo it.
+
+## Package Config
+
+Make the shared package work as an internal Turborepo package:
+
+```json
+// packages/shared/package.json
+{
+  "name": "@govantazh/shared",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}
+```
+
+Reference it in consumers:
+
+```json
+// packages/api/package.json
+{
+  "dependencies": {
+    "@govantazh/shared": "workspace:*"
+  }
+}
+```
+
+The `workspace:*` protocol is pnpm's way of saying "resolve this from the monorepo, not npm." Turborepo handles the build ordering so `shared` is always ready before `api` and `web` build.
+
+## Turborepo Pipeline
+
+```json
+// turbo.json
+{
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"]
+    },
+    "typecheck": {
+      "dependsOn": ["^build"]
+    }
+  }
+}
+```
+
+The `^build` means "build all dependencies first." So when you typecheck `packages/api`, Turborepo ensures `packages/shared` has built (or its types are available) first.
+
+This matters for CI. If you run `turbo typecheck` without the pipeline, you might typecheck `api` before `shared` has processed its type exports, and get false errors.
+
+## What This Doesn't Solve
+
+**Runtime validation.** TypeScript assertions (`as PaginatedResponse<Cargo>`) don't validate at runtime. If your API returns something wrong, the frontend will happily accept it and fail weirdly later.
+
+If you need runtime validation, add [Zod](https://zod.dev/) schemas to your shared package and parse responses through them. It's more verbose but gives you actual runtime guarantees.
+
+We didn't add Zod to govantazh because:
+1. We control both the API and frontend — no external consumers
+2. The transform layer catches most shape mismatches at the boundary
+3. TypeScript + strict mode catches most issues at compile time
+
+For public APIs or APIs consumed by third parties, Zod (or similar) is worth the overhead.
+
+**Auto-generation.** Tools like [tRPC](https://trpc.io/) or [Hono's RPC client](https://hono.dev/guides/rpc) can generate client code from your route definitions, giving you end-to-end type safety without manual type definitions. We didn't use them because:
+
+- tRPC adds a significant abstraction layer and requires wrapping all your routes
+- Hono RPC works well but assumes you're using Hono's validator for request types
+- The shared package approach is simpler and requires less framework buy-in
+
+If you're starting fresh and want maximum type safety, tRPC or Hono RPC are excellent. If you already have a REST API and want to add type sharing without a rewrite, the shared package pattern is the pragmatic path.
+
+## The Discipline Part
+
+This pattern only works if everyone follows it. The shared package is useful because it's **the single source of truth**. The moment someone types `response as any` or defines a `Cargo` interface locally in the web package, the contract breaks.
+
+A few rules that help:
+
+1. **No domain types in `api` or `web`** — only in `shared`. Enforce with ESLint if needed.
+2. **Transform functions return shared types explicitly** — `function cargoToApi(...): Cargo`. Not inferred.
+3. **Prefer type assertions over `any`** — `as PaginatedResponse<Cargo>` at least documents what you expect.
+4. **Run `turbo typecheck` in CI** — catches drift early.
+
+The discipline overhead is low if you set it up at the start. It's high if you try to retrofit it into an existing codebase with 200 local type definitions.
+
+## Real Impact
+
+In govantazh, this pattern let us:
+
+- Rename `availability` to `is_available` on the Driver type across the whole codebase in one change — TypeScript errored everywhere the old name was used
+- Add a required `threadId` field to bid creation — TypeScript told us every frontend call site that was missing it
+- Refactor the SSE message format — one change in `shared/types/api.ts`, TypeScript guided the API handler and frontend listener to update in sync
+
+The alternative is a lot of `console.log(JSON.stringify(response))` debugging sessions at 2 AM wondering why the field is `undefined` when you're sure the API is returning it.
+
+---
+
+*govantazh is a logistics SaaS I'm building for Ukrainian freight brokers and drivers. It uses Turborepo + Hono + React Router v7 + SQLite.*
