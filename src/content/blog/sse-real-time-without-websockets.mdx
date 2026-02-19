@@ -1,0 +1,318 @@
+---
+title: "Server-Sent Events: Real-Time Without the WebSocket Complexity"
+description: "Why I chose SSE over WebSockets for a logistics SaaS, what the tradeoffs actually look like, and the gotchas that cost me time."
+pubDate: "2026-02-19"
+tags: ["typescript", "hono", "react", "sse", "saas"]
+---
+
+When I started building real-time features for [Govantazh](https://govantazh.com) — a cargo management SaaS — the instinct was WebSockets. That's what everyone uses for "real-time," right?
+
+I ended up choosing Server-Sent Events instead. Six months later, I don't regret it.
+
+This is what I learned: when SSE fits, it fits beautifully. When it doesn't, you'll know quickly.
+
+---
+
+## The Use Case That Pushed Me Toward SSE
+
+Govantazh tracks cargo shipments in real time. Dispatchers need live updates when:
+- A driver updates their status
+- A shipment changes state (picked up, in transit, delivered)
+- A new order comes in
+
+The update pattern is **almost entirely server → client**. The client doesn't need to push data back over the same connection. It submits forms, fires POST requests — but "real-time" means watching a dashboard update as things happen.
+
+That's the exact shape SSE was designed for.
+
+---
+
+## What SSE Actually Is
+
+Server-Sent Events is an HTTP/1.1 feature. You open a regular HTTP connection to an endpoint, and instead of closing it after a response, the server keeps it open and streams events as they happen.
+
+The wire format is simple:
+```
+data: {"type":"shipment_update","id":"abc123","status":"in_transit"}\n\n
+```
+
+Double newline terminates an event. The browser's `EventSource` API handles reconnection automatically.
+
+That's... it. No handshake, no binary framing, no upgrade dance. Just HTTP.
+
+---
+
+## The Hono Implementation
+
+Here's the actual SSE endpoint from Govantazh (simplified):
+
+```typescript
+// apps/api/src/routes/events.ts
+import { Hono } from 'hono'
+import { streamSSE } from 'hono/streaming'
+
+// In-memory pub/sub (fine for single-instance deployments)
+const subscribers = new Map<string, Set<(event: unknown) => void>>()
+
+export function publish(tenantId: string, event: unknown) {
+  const listeners = subscribers.get(tenantId)
+  if (!listeners) return
+  for (const fn of listeners) fn(event)
+}
+
+const events = new Hono()
+
+events.get('/stream', async (c) => {
+  const tenantId = c.get('tenantId') // set by auth middleware
+  
+  return streamSSE(c, async (stream) => {
+    // Register this connection
+    if (!subscribers.has(tenantId)) {
+      subscribers.set(tenantId, new Set())
+    }
+    
+    const send = async (event: unknown) => {
+      await stream.writeSSE({
+        data: JSON.stringify(event),
+        event: 'update',
+        id: String(Date.now()),
+      })
+    }
+    
+    subscribers.get(tenantId)!.add(send)
+    
+    // Send initial heartbeat so client knows connection is alive
+    await stream.writeSSE({ data: 'connected', event: 'heartbeat' })
+    
+    // Keep alive with periodic pings (prevents proxy timeouts)
+    const keepAlive = setInterval(async () => {
+      await stream.writeSSE({ data: '', event: 'ping' }).catch(() => {})
+    }, 25_000)
+    
+    // Clean up when client disconnects
+    stream.onAbort(() => {
+      subscribers.get(tenantId)?.delete(send)
+      clearInterval(keepAlive)
+    })
+    
+    // Wait indefinitely
+    await new Promise((resolve) => stream.onAbort(resolve))
+  })
+})
+
+export { events }
+```
+
+Then anywhere I update state, I call `publish()`:
+
+```typescript
+// When a shipment status changes
+await db.update(shipments).set({ status: newStatus }).where(eq(shipments.id, id))
+publish(tenantId, { type: 'shipment_update', id, status: newStatus })
+```
+
+---
+
+## The React Side
+
+```typescript
+// hooks/useRealtimeUpdates.ts
+import { useEffect, useCallback } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
+
+export function useRealtimeUpdates() {
+  const queryClient = useQueryClient()
+  
+  useEffect(() => {
+    const es = new EventSource('/api/events/stream', {
+      withCredentials: true,
+    })
+    
+    es.addEventListener('update', (e) => {
+      const event = JSON.parse(e.data)
+      
+      switch (event.type) {
+        case 'shipment_update':
+          // Invalidate the affected query — React Query refetches
+          queryClient.invalidateQueries({ queryKey: ['shipment', event.id] })
+          queryClient.invalidateQueries({ queryKey: ['shipments'] })
+          break
+        case 'new_order':
+          queryClient.invalidateQueries({ queryKey: ['orders'] })
+          break
+      }
+    })
+    
+    es.addEventListener('heartbeat', () => {
+      // Connection confirmed
+    })
+    
+    es.onerror = () => {
+      // EventSource reconnects automatically — no manual handling needed
+      // Browser waits ~3s then retries
+    }
+    
+    return () => es.close()
+  }, [queryClient])
+}
+```
+
+I use it at the layout level so it's active across all admin pages. State updates flow through React Query — the SSE just tells RQ when to invalidate, then RQ's normal fetching takes over.
+
+This is the pattern I'd recommend: **SSE as an invalidation signal, not as a data carrier**. You avoid the complexity of keeping client-side state in sync from streamed data.
+
+---
+
+## What Actually Tripped Me Up
+
+### 1. Nginx proxy timeouts
+
+Default Nginx `proxy_read_timeout` is 60 seconds. SSE connections need to stay open much longer. Without the fix, clients would silently disconnect every minute:
+
+```nginx
+location /api/events {
+    proxy_pass http://backend;
+    proxy_buffering off;           # Critical — don't buffer SSE
+    proxy_cache off;
+    proxy_read_timeout 3600;       # 1 hour
+    proxy_set_header Connection ''; # Don't forward Connection: close
+    proxy_http_version 1.1;
+    chunked_transfer_encoding on;
+    
+    # These headers tell the browser it's SSE
+    add_header Content-Type text/event-stream;
+    add_header Cache-Control no-cache;
+    add_header X-Accel-Buffering no;
+}
+```
+
+The `X-Accel-Buffering: no` header is the Nginx-specific one. Without it, even with `proxy_buffering off` in the config, Nginx buffers SSE internally.
+
+### 2. The subscriber leak
+
+My first version stored subscribers by connection, not by tenant. When I added multi-tenancy, cross-tenant events started leaking. Classic mistake.
+
+The fix: always key subscribers by a scope (tenant, user, room — whatever makes sense for your domain). Never store "all subscribers" in one flat set.
+
+### 3. Reconnection state
+
+When the client reconnects after a network hiccup, it sends the `Last-Event-ID` header with the ID of the last event it received. I initially ignored this.
+
+The better approach:
+```typescript
+events.get('/stream', async (c) => {
+  const lastEventId = c.req.header('Last-Event-ID')
+  
+  return streamSSE(c, async (stream) => {
+    // If client missed events, replay them
+    if (lastEventId) {
+      const missed = await getMissedEvents(tenantId, lastEventId)
+      for (const event of missed) {
+        await stream.writeSSE({ data: JSON.stringify(event), id: event.id })
+      }
+    }
+    
+    // Then subscribe to live updates...
+  })
+})
+```
+
+For Govantazh I skipped the replay system (the UI just refetches on reconnect), but for financial data or anything where missed events matter, implement it.
+
+### 4. Connection limits per domain
+
+Browsers limit HTTP/1.1 connections to 6 per domain. SSE holds one of those slots permanently. If you have multiple browser tabs, you burn through the limit fast.
+
+HTTP/2 removes this limit entirely (streams over a single connection). Make sure your reverse proxy supports HTTP/2 end-to-end:
+
+```nginx
+server {
+    listen 443 ssl http2;
+    # ...
+}
+```
+
+---
+
+## When WebSockets Are Actually Better
+
+SSE is one-directional: server pushes, client listens. If you need bidirectional real-time communication, SSE starts to feel wrong:
+
+- **Collaborative editing** — both sides need to push state continuously
+- **Chat applications** — high-frequency client → server messages
+- **Gaming** — low latency bidirectional is a hard requirement
+- **Signaling for WebRTC** — you need bidirectional for the handshake
+
+For these use cases, WebSockets win. SSE's one-directionality isn't a workaround; it's the design. Stop fighting it.
+
+The heuristic I use: if I'm implementing the client side with "submit a form" or "fire a fetch," SSE is probably right. If the client needs to push data continuously and fast, WebSockets.
+
+---
+
+## The Honest Tradeoff Summary
+
+**SSE wins:**
+- Simpler server implementation (just HTTP)
+- Works through HTTP/2 multiplexing natively
+- Auto-reconnect built into the browser
+- Easier to proxy/load balance (regular HTTP)
+- No library needed on client (`EventSource` is native)
+
+**WebSockets win:**
+- Bidirectional communication
+- Lower overhead for high-frequency messaging (no HTTP headers per message)
+- Binary data support (though SSE can base64 encode)
+- Wider ecosystem (socket.io, etc.)
+
+**The ignored middle option:**
+Long polling. For low-frequency updates (< once per minute), long polling is often the right answer. No persistent connection, works everywhere, trivial to implement. I see teams reach for WebSockets when long polling would be simpler and just as effective.
+
+---
+
+## One Year of SSE in Production
+
+Govantazh has been running SSE in production for months. What I've found:
+
+- **Reliability is good.** `EventSource` reconnection handles the flaky network cases automatically.
+- **Scaling is the main challenge.** The in-memory subscriber map doesn't survive horizontal scaling. For multiple API instances, you need a pub/sub layer (Redis pub/sub is the standard answer).
+- **It's invisible to users.** Which is exactly what you want from infrastructure.
+
+If I were building a multi-instance deployment from day one, I'd add Redis pub/sub from the start. For a single-server SaaS, the in-memory approach works fine and is much simpler.
+
+---
+
+## Quick-Start Template
+
+The minimum viable SSE setup for a Hono + React stack:
+
+**Server:**
+```typescript
+import { streamSSE } from 'hono/streaming'
+
+const listeners = new Set<(e: unknown) => void>()
+
+app.get('/events', (c) =>
+  streamSSE(c, async (stream) => {
+    const send = (e: unknown) => stream.writeSSE({ data: JSON.stringify(e) })
+    listeners.add(send)
+    stream.onAbort(() => listeners.delete(send))
+    await new Promise((r) => stream.onAbort(r))
+  })
+)
+
+export const broadcast = (event: unknown) => {
+  for (const fn of listeners) fn(event)
+}
+```
+
+**Client:**
+```typescript
+useEffect(() => {
+  const es = new EventSource('/events')
+  es.onmessage = (e) => handleEvent(JSON.parse(e.data))
+  return () => es.close()
+}, [])
+```
+
+That's the whole thing. Add auth, tenant scoping, and keep-alive pings as you need them.
+
+The lesson: reach for the simpler tool first. For most real-time dashboards, SSE is simpler than WebSockets and more than sufficient.
