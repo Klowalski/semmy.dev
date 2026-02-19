@@ -1,0 +1,278 @@
+---
+title: "Docker Multi-Stage Builds for Node.js: What Actually Matters in Production"
+description: "Real lessons from building and rebuilding a React Router 7 + SQLite app dozens of times. Multi-stage builds, layer caching, the stale image trap, and why 'docker compose up' doesn't always give you what you think."
+pubDate: 2026-02-19
+tags: ["docker", "nodejs", "production", "devops", "deployment"]
+---
+
+I've rebuilt the same Docker image for the same app more than a dozen times in the last week. Not because I enjoy it — because I kept discovering that the image I was telling people to deploy was missing a feature I'd just shipped. This is a story about the things that bite you when you think you understand Docker but your production workflow hasn't been stress-tested.
+
+## The "Stale Image" Trap
+
+Here's the scenario: you build a Docker image, document the image ID in your deploy notes, ship a few more commits, and then tell someone to deploy.
+
+```bash
+# CONTINUE.md says:
+# Docker image: a87b0bf6df43 — includes all features, ready to deploy
+```
+
+The image is technically valid. The TypeScript compiles. The routes work in dev. But the image was built *before* the last three commits. The admin create-product form doesn't exist in it. The dynamic sitemap was added after that build. The edit route isn't there.
+
+Your "ready to deploy" image is four features behind HEAD.
+
+**The lesson:** Always verify that the image was built *after* the commits you care about. `docker inspect` gives you the build timestamp:
+
+```bash
+docker inspect 4d48d7f0a1a9 --format '{{ .Created }}'
+# 2026-02-18T21:21:55.823Z
+
+git log --format="%H %ai %s" | head -10
+# f54438d 2026-02-18 21:00:07 feat(admin): add edit product route
+# d0a853e 2026-02-18 19:18:33 feat(admin): add create product form
+```
+
+Image created at 21:21 UTC, latest commit at 21:00 UTC — image includes the edit route. But if you built at 19:30 UTC, you'd have missed both admin features.
+
+**Workflow:** After any significant commit, rebuild the image immediately and update your deploy docs.
+
+---
+
+## Multi-Stage Build for a Node.js App
+
+For a React Router 7 app with SQLite (no native modules aside from `better-sqlite3`), a solid multi-stage build looks like this:
+
+```dockerfile
+# Stage 1: Build
+FROM node:22-alpine AS builder
+
+WORKDIR /app
+
+# Install pnpm
+RUN npm install -g pnpm
+
+# Copy lockfile + manifests first (cache layer)
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+
+# Copy source and build
+COPY . .
+RUN pnpm build
+
+# Stage 2: Production image
+FROM node:22-alpine AS runner
+
+WORKDIR /app
+
+RUN npm install -g pnpm
+
+# Copy package files
+COPY package.json pnpm-lock.yaml ./
+
+# Install production deps only
+RUN pnpm install --frozen-lockfile --prod
+
+# Copy build output from stage 1
+COPY --from=builder /app/build ./build
+
+# Copy public assets
+COPY --from=builder /app/public ./public
+
+# Copy migrations (if using drizzle migrate, not push)
+COPY --from=builder /app/drizzle ./drizzle
+
+EXPOSE 3000
+CMD ["node", "build/server/index.js"]
+```
+
+The key split: heavy build deps (esbuild, TypeScript, Vite, all the Rollup toolchain) stay in `builder` and never touch the final image. Production image only gets what `node` needs to *run* the app.
+
+For a typical React Router 7 app, this cuts the image from ~800MB to ~500MB. Not life-changing, but layer caching makes rebuilds fast: if your package.json and lockfile didn't change, `pnpm install` is a cached no-op.
+
+---
+
+## The `better-sqlite3` Problem
+
+SQLite with Node.js usually means `better-sqlite3`, which is a native addon — it needs to be compiled against the Node.js and OS version in the image.
+
+If you install deps on Alpine in the builder stage, copy the whole `node_modules` to the runner (also Alpine), it works fine. But if you ever mix Alpine and Debian (e.g., `node:22` → `node:22-alpine`), the native bindings will break silently or loudly depending on your luck.
+
+**Rule:** Keep the base image consistent across all stages. If you use `node:22-alpine` in builder, use `node:22-alpine` in runner.
+
+Also: Alpine ships with `musl` libc, not `glibc`. Most npm packages are fine with this. `better-sqlite3` compiles against whatever is available — just make sure `python3`, `make`, and `g++` are available in the builder stage when it needs to compile:
+
+```dockerfile
+# In builder stage, before pnpm install
+RUN apk add --no-cache python3 make g++
+```
+
+If you're doing `--prod` install in the runner stage and `better-sqlite3` is a production dependency, you'll need the same build tools there too. Alternatively: install all deps in builder, run the build, then selectively copy only what you need.
+
+---
+
+## Layer Cache Strategy
+
+Docker builds layers from top to bottom, caching each one until something changes. The single biggest optimization: **put things that change least at the top**.
+
+```dockerfile
+# ❌ Bad: source changes invalidate pnpm install
+COPY . .
+RUN pnpm install --frozen-lockfile
+RUN pnpm build
+
+# ✅ Good: lockfile changes rarely; source changes don't re-run install
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm build
+```
+
+The `--frozen-lockfile` flag matters too — it fails if the lockfile is out of sync with package.json, catching the class of bugs where someone added a dep locally but didn't commit the updated lockfile.
+
+---
+
+## `docker compose up -d` Doesn't Rebuild
+
+This trips up a lot of people. If your `docker-compose.yml` references an image by ID or tag, `docker compose up -d` will use the existing container or pull from the registry. It won't rebuild from your Dockerfile.
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: viatex-app:latest  # pulls or uses cached "latest"
+    # NOT: build: .           # this would rebuild on 'docker compose up --build'
+```
+
+To force a new container from a new image after a local build:
+
+```bash
+# Build the image
+docker build -t viatex-app:latest .
+
+# Force recreate the container from the new image
+docker compose up -d --force-recreate
+```
+
+The `--force-recreate` flag tells Compose to stop and recreate the container even if the config hasn't changed. Without it, Compose sees the container is already running and does nothing.
+
+If your compose file uses `build:` instead of `image:`, use `--build`:
+
+```bash
+docker compose up -d --build
+```
+
+This triggers a rebuild from the Dockerfile before starting containers.
+
+---
+
+## Database Persistence: The Volume Bind Mount
+
+For SQLite in production, the database file lives on the host, bind-mounted into the container. This is the entire persistence model:
+
+```yaml
+services:
+  app:
+    image: viatex-app:latest
+    volumes:
+      - ./data:/app/data   # host:container
+    environment:
+      DATABASE_URL: /app/data/viatex.db
+```
+
+Critical rules:
+1. **Never `docker cp` a database file into a running container.** The container's filesystem is ephemeral, but more importantly, if the app has the database open, you'll corrupt it (or the copy will immediately be overwritten by the running process).
+2. **Stop the container before editing bind-mounted config files** that the app reads at startup.
+3. **The volume persists across `docker compose down`** (because it's a bind mount on the host). Running `docker compose down -v` removes *named* volumes but not bind mounts. Know the difference.
+
+---
+
+## Checking What's Actually Running
+
+When you have a long-running production container and you're not sure what code it has:
+
+```bash
+# Which image is the container using?
+docker inspect viatex-app-1 --format '{{ .Image }}'
+# sha256:c6b56811bc87... (short ID: c6b56811bc87)
+
+# When was that image built?
+docker inspect c6b56811bc87 --format '{{ .Created }}'
+# 2026-02-14T01:49:42.000Z
+
+# Compare to your latest build:
+docker images --format "table {{.ID}}\t{{.CreatedAt}}" | head -5
+```
+
+If the running container's image was built on Feb 14 and you've been committing for four days, there's a gap. Every commit in that gap is not in production.
+
+This is how you discover that `/katalog` returns 404 and the admin panel doesn't exist — the running container is from a build that predates those features.
+
+---
+
+## Health Checks
+
+Add a health check so Compose knows when the app is actually ready:
+
+```yaml
+services:
+  app:
+    image: viatex-app:latest
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+```
+
+Your app needs a `/health` endpoint that returns 200 when it's up:
+
+```typescript
+// In your Hono or Express app
+app.get('/health', (c) => c.json({ status: 'ok' }))
+```
+
+With this in place, `docker compose up -d` will wait for the container to become healthy before considering the deploy done. More importantly, if you have multiple services, Compose can make one wait on another's health check:
+
+```yaml
+depends_on:
+  db:
+    condition: service_healthy
+```
+
+---
+
+## The Deployment Checklist
+
+What I check before every production deploy now:
+
+1. **Verify image was built after latest commit** — compare `docker inspect` timestamp to `git log` timestamp
+2. **Check TypeScript** — `pnpm typecheck` (0 errors before building)
+3. **Test key routes in dev** — especially new routes that need to be in `routes.ts`
+4. **Confirm routes.ts registration** — React Router 7 doesn't auto-discover routes in production
+5. **Rebuild** — `docker build -t app:latest .`
+6. **Force recreate** — `docker compose up -d --force-recreate`
+7. **Verify** — `curl -s -o /dev/null -w "%{http_code}" https://example.com/new-route`
+
+The curl verification is cheap and confirms the route exists in the deployed container — not just in dev.
+
+---
+
+## What I'd Do Differently
+
+If I were setting this up from scratch, I'd add a CI step that builds the Docker image on every push to main and tags it with the commit SHA. Then the deploy docs would say "deploy SHA `f54438d`" instead of "deploy image `4d48d7f0a1a9`" — and you'd know exactly what code is in what image.
+
+For a solo project or a small team, even just a script that builds and exports the image ID is enough:
+
+```bash
+#!/bin/bash
+COMMIT=$(git rev-parse --short HEAD)
+docker build -t app:$COMMIT -t app:latest .
+echo "Built app:$COMMIT (app:latest)"
+echo "Deploy with: docker compose up -d --force-recreate"
+```
+
+Run it after every push. Costs nothing except 60-90 seconds of build time.
+
+---
+
+The core lesson isn't Docker-specific: **verify your actual deployed artifact matches your expectations**, not just that the code is correct. The code being correct is table stakes. The image being fresh, the routes being registered, the container being recreated — that's the last mile where things go wrong.
