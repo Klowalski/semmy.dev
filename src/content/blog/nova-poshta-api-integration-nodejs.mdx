@@ -1,0 +1,462 @@
+---
+title: "Nova Poshta API Integration in Node.js: The Parts Nobody Documents"
+description: "Practical guide to integrating Nova Poshta's API for city/warehouse search, shipping cost calculation, TTN (waybill) creation, and parcel tracking — with real TypeScript code from a production Ukrainian e-commerce store."
+pubDate: 2026-02-19
+tags: ["nova-poshta", "nodejs", "typescript", "ukraine", "ecommerce", "api"]
+---
+
+Nova Poshta is the dominant courier/logistics provider in Ukraine. If you're building e-commerce for Ukrainian customers, you're integrating Nova Poshta. The official docs at [developers.novaposhta.ua](https://developers.novaposhta.ua) exist, but they're dense, partially incomplete, and don't cover the gotchas that only appear in production. This is the guide I wish existed when I built this for a Ukrainian socks manufacturer.
+
+## The API Shape
+
+Nova Poshta uses a single POST endpoint for everything:
+
+```
+POST https://api.novaposhta.ua/v2.0/json/
+```
+
+Every request has the same structure:
+
+```typescript
+{
+  apiKey: string,
+  modelName: string,     // "Address", "Counterparty", "InternetDocument", etc.
+  calledMethod: string,  // "getCities", "save", "getStatusDocuments", etc.
+  methodProperties: {}   // Varies by model+method
+}
+```
+
+The response always looks like:
+
+```typescript
+interface NovaPoshtaResponse<T> {
+  success: boolean;
+  data: T[];          // Array, even for single results
+  errors: string[];   // Error strings (not structured objects)
+  warnings: string[];
+  info: Record<string, unknown>;
+}
+```
+
+One thing that catches people off guard: `success: true` doesn't mean what you think. The API returns `success: true` for requests that found zero results. Always check `data.length`, not just `success`.
+
+## The Client Layer
+
+Wrap the raw fetch in a reusable function that handles auth and retries:
+
+```typescript
+const NOVA_POSHTA_API_URL = "https://api.novaposhta.ua/v2.0/json/";
+const MAX_RETRIES = 3;
+const RETRY_BASE_DELAY = 500; // ms
+
+async function apiRequest<T>(
+  modelName: string,
+  calledMethod: string,
+  methodProperties: Record<string, unknown>,
+  retryCount = 0
+): Promise<NovaPoshtaResponse<T>> {
+  const apiKey = await getApiKeyFromConfig(); // from env or DB
+  if (!apiKey) {
+    throw new Error("Nova Poshta API key not configured");
+  }
+
+  const response = await fetch(NOVA_POSHTA_API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ apiKey, modelName, calledMethod, methodProperties }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Nova Poshta HTTP error: ${response.statusText}`);
+  }
+
+  const result: NovaPoshtaResponse<T> = await response.json();
+
+  // Rate limiting appears as a string error, not an HTTP status
+  if (!result.success && result.errors.some(e => e.toLowerCase().includes("many requests"))) {
+    if (retryCount < MAX_RETRIES) {
+      const delay = RETRY_BASE_DELAY * Math.pow(2, retryCount); // 500, 1000, 2000ms
+      await new Promise(resolve => setTimeout(resolve, delay));
+      return apiRequest(modelName, calledMethod, methodProperties, retryCount + 1);
+    }
+  }
+
+  return result;
+}
+```
+
+Key points:
+- **API key from config, not hardcoded** — merchants need to rotate keys, and different tenants have different keys
+- **Rate limiting is a body error, not a 429** — you have to parse the error string
+- **Exponential backoff** — Nova Poshta doesn't publish rate limits, but they exist
+
+## City and Warehouse Lookup
+
+The two-step flow: user picks a city, then picks a warehouse in that city.
+
+### Step 1: City Search
+
+There are two city search methods and they behave differently:
+
+```typescript
+// Method 1: searchSettlements — works for small towns and villages
+// Returns nested structure: result.data[0].Addresses[]
+async function searchSettlements(query: string): Promise<NovaPoshtaCity[]> {
+  const response = await apiRequest<{ Addresses: SearchSettlementsAddress[] }>(
+    "Address",
+    "searchSettlements",
+    { CityName: query, Limit: 20 }
+  );
+
+  const addresses = response.data[0]?.Addresses || [];
+  return addresses.map(addr => ({
+    Ref: addr.DeliveryCity, // ← NOT addr.Ref — this is the critical one for warehouse lookup
+    Description: addr.MainDescription,
+    Area: addr.Area,
+  }));
+}
+
+// Method 2: getCities — works better for large cities
+// Returns flat array: result.data[]
+async function getCities(query: string): Promise<NovaPoshtaCity[]> {
+  const response = await apiRequest<NovaPoshtaCity>(
+    "Address",
+    "getCities",
+    { FindByString: query, Limit: 20 }
+  );
+  return response.data;
+}
+```
+
+**The `DeliveryCity` vs `Ref` trap**: When using `searchSettlements`, the `Ref` field in the response is the settlement Ref — but to look up warehouses you need the `DeliveryCity` field. Use the wrong one and your warehouse lookup returns empty or wrong results. I wasted two hours on this.
+
+### Step 2: Warehouse Search
+
+Once you have the city `Ref` (specifically the `DeliveryCity` from the previous step):
+
+```typescript
+const WAREHOUSE_TYPE_REFS = {
+  cargo: "9a68df70-0267-42a8-bb5c-37f427e36ee4",    // Cargo warehouses (heavy items)
+  branch: "841339c7-591a-42e2-8233-7a0a00f0ed6f",   // Standard branches (up to 30kg)
+  postomat: "f9316480-5f2d-425d-bc2c-ac7cd29decf0", // Parcel lockers
+};
+
+async function getWarehouses(
+  cityRef: string,
+  query?: string,
+  category: "branch" | "poshtomat" | "all" = "branch"
+): Promise<NovaPoshtaWarehouse[]> {
+  const methodProperties: Record<string, unknown> = {
+    CityRef: cityRef,
+    Limit: 50,
+  };
+
+  // Different search param for branch (number) vs poshtomat (text)
+  if (category === "branch" && query && /^\d+$/.test(query)) {
+    methodProperties.WarehouseId = query; // "42" finds "Branch #42"
+  } else {
+    methodProperties.FindByString = query || "";
+  }
+
+  if (category !== "all") {
+    methodProperties.TypeOfWarehouseRef = WAREHOUSE_TYPE_REFS[
+      category === "poshtomat" ? "postomat" : "branch"
+    ];
+  }
+
+  const response = await apiRequest<NovaPoshtaWarehouse>(
+    "Address",
+    "getWarehouses",
+    methodProperties
+  );
+
+  return response.success ? response.data : [];
+}
+```
+
+**Why `WarehouseId` for numeric queries**: The `FindByString` param on warehouse search is a text match against the description. If a user types "42", you get all warehouses where the description *contains* "42" — which includes "Branch #142", "Branch #242", etc. Using `WarehouseId` gives exact number matching.
+
+## Shipping Cost Calculation
+
+```typescript
+interface ShippingCostInput {
+  cityRef: string;       // Sender city ref
+  recipientCityRef: string;
+  weight: number;        // kg
+  declaredValue: number; // UAH
+  serviceType: "WarehouseWarehouse" | "WarehouseDoors" | "DoorsDoors";
+}
+
+async function calculateShippingCost(input: ShippingCostInput): Promise<number> {
+  const response = await apiRequest<{ Cost: number; AssessedCost: number }>(
+    "InternetDocument",
+    "getDocumentPrice",
+    {
+      CitySender: input.cityRef,
+      CityRecipient: input.recipientCityRef,
+      ServiceType: input.serviceType,
+      Weight: input.weight,
+      Cost: input.declaredValue,
+      CargoType: "Parcel",
+      SeatsAmount: 1,
+    }
+  );
+
+  if (!response.success || response.data.length === 0) {
+    throw new Error("Could not calculate shipping cost");
+  }
+
+  return response.data[0].Cost;
+}
+```
+
+The cost estimate is useful for checkout UX — show customers an estimate before they commit. **Important**: The estimated cost is not exact. Nova Poshta does their own measurement at the warehouse. Factor a 5-10% margin into any guarantee you make to customers.
+
+## Creating TTNs (Waybills)
+
+This is where it gets complex. Creating a TTN requires two steps: create a recipient counterparty, then create the document.
+
+### Step 1: Create Recipient
+
+Nova Poshta's document API requires a "counterparty ref" for both sender and recipient. The sender ref you configure once in admin settings. The recipient ref must be created fresh for each new customer.
+
+```typescript
+async function createRecipientCounterparty(
+  name: string,
+  phone: string
+): Promise<{ counterpartyRef: string; contactRef: string } | null> {
+  const { firstName, lastName, middleName } = parseUkrainianName(name);
+
+  const response = await apiRequest<{
+    Ref: string;
+    ContactPerson?: { data: Array<{ Ref: string }> };
+  }>(
+    "Counterparty",
+    "save",
+    {
+      FirstName: firstName,
+      LastName: lastName || firstName, // Ukrainian names sometimes have no separate family name
+      MiddleName: middleName,
+      Phone: formatPhoneUA(phone), // Must be 380XXXXXXXXX format
+      CounterpartyType: "PrivatePerson",
+      CounterpartyProperty: "Recipient",
+    }
+  );
+
+  if (!response.success || !response.data[0]) return null;
+
+  const counterparty = response.data[0];
+  let contactRef = counterparty.ContactPerson?.data?.[0]?.Ref;
+
+  // Sometimes the contact person is NOT embedded in the save response
+  // You have to fetch it separately
+  if (!contactRef) {
+    const contactResponse = await apiRequest<{ Ref: string }>(
+      "Counterparty",
+      "getCounterpartyContactPersons",
+      { Ref: counterparty.Ref }
+    );
+    contactRef = contactResponse.data[0]?.Ref;
+  }
+
+  if (!contactRef) return null;
+
+  return { counterpartyRef: counterparty.Ref, contactRef };
+}
+```
+
+**The contact person two-fetch problem**: Nova Poshta's `Counterparty/save` *should* return the contact person embedded in the response. In practice, it sometimes doesn't — especially on first creation. The fallback fetch for `getCounterpartyContactPersons` is mandatory, not optional.
+
+### Step 2: Create the Document
+
+```typescript
+async function createTTN(order: Order, settings: SenderSettings): Promise<CreateTTNResult> {
+  const recipient = await createRecipientCounterparty(
+    order.recipientName,
+    order.recipientPhone
+  );
+
+  if (!recipient) {
+    return { success: false, error: "Failed to create recipient" };
+  }
+
+  const response = await apiRequest<{
+    Ref: string;
+    IntDocNumber: string;
+    CostOnSite: number;
+    EstimatedDeliveryDate: string;
+  }>(
+    "InternetDocument",
+    "save",
+    {
+      // Sender (pre-configured in admin settings)
+      Sender: settings.senderCounterpartyRef,
+      ContactSender: settings.senderContactRef,
+      SendersPhone: formatPhoneUA(settings.senderPhone),
+      SenderAddress: settings.senderWarehouseRef,
+      CitySender: settings.senderCityRef,
+
+      // Recipient (just created)
+      Recipient: recipient.counterpartyRef,
+      ContactRecipient: recipient.contactRef,
+      RecipientsPhone: formatPhoneUA(order.recipientPhone),
+      RecipientAddress: order.warehouseRef,
+      CityRecipient: order.cityRef,
+
+      // Service
+      ServiceType: "WarehouseWarehouse",
+      PayerType: "Recipient",  // Customer pays shipping on delivery
+      PaymentMethod: "Cash",
+
+      // Cargo
+      CargoType: "Parcel",
+      SeatsAmount: 1,
+      Weight: calculateWeight(order),
+      VolumeGeneral: 0.001, // Minimum volume — required field
+
+      // Cost and description
+      Description: "Товар",
+      Cost: order.declaredValue,
+
+      // Date (Nova Poshta format: DD.MM.YYYY)
+      DateTime: formatDateNP(new Date()),
+
+      // Link back to your order for reference
+      InfoRegClientBarcodes: order.orderNumber,
+    }
+  );
+
+  if (!response.success || !response.data[0]) {
+    return { success: false, error: response.errors.join(", ") };
+  }
+
+  return {
+    success: true,
+    trackingNumber: response.data[0].IntDocNumber,
+    documentRef: response.data[0].Ref,
+    estimatedDeliveryDate: response.data[0].EstimatedDeliveryDate,
+    shippingCost: response.data[0].CostOnSite,
+  };
+}
+```
+
+**`VolumeGeneral: 0.001`** — This field is required but Nova Poshta won't tell you that. Omit it and the API returns a cryptic error. The minimum value is 0.001 (essentially "no volume").
+
+**`InfoRegClientBarcodes`** — Not well documented but very useful: store your internal order number here. It shows up in the Nova Poshta admin when you look up the TTN, making it easy to cross-reference.
+
+**Phone format** — Must be `380XXXXXXXXX`. Not `+380...`, not `0...`, not with dashes. Write a normalizer:
+
+```typescript
+function formatPhoneUA(phone: string): string {
+  const digits = phone.replace(/\D/g, "");
+  if (digits.startsWith("380")) return digits;
+  if (digits.startsWith("0") && digits.length === 10) return "38" + digits;
+  if (digits.length === 9) return "380" + digits;
+  return digits;
+}
+```
+
+## Parcel Tracking
+
+```typescript
+async function getTrackingInfo(trackingNumber: string) {
+  const response = await apiRequest<{
+    Status: string;
+    StatusCode: string;
+    WarehouseRecipient: string;
+    DateReceived: string;
+  }>(
+    "TrackingDocument",
+    "getStatusDocuments",
+    {
+      Documents: [{ DocumentNumber: trackingNumber }]
+    }
+  );
+
+  if (!response.success || !response.data[0]) {
+    return null;
+  }
+
+  const tracking = response.data[0];
+  return {
+    status: tracking.Status,
+    statusCode: parseInt(tracking.StatusCode, 10),
+    warehouse: tracking.WarehouseRecipient,
+    dateReceived: tracking.DateReceived,
+  };
+}
+```
+
+**Poll, don't webhook**: Nova Poshta doesn't have webhooks for status changes. You have to poll. A reasonable schedule: every 2 hours once a TTN is created, stop polling after status codes 7 (delivered) or 102-106 (various returned/cancelled states). Build a cron job, not a per-request fetch.
+
+### Status Code Reference
+
+Nova Poshta has ~40 status codes. The ones you actually care about for order management:
+
+| Code | Meaning |
+|------|---------|
+| 1 | Waybill created |
+| 2 | In transit |
+| 3 | At recipient city warehouse |
+| 7 | Delivered |
+| 8 | Not delivered / returned to sender |
+| 9 | Preparing for return |
+| 11 | Returned to sender |
+| 102 | Recipient did not pick up |
+
+Show customers the human-readable `Status` string; use `StatusCode` for your logic.
+
+## Getting Sender Settings
+
+Before any TTN can be created, the merchant needs to configure sender details. This is a one-time setup, not per-order. I store this in the database and expose an admin settings page:
+
+```typescript
+interface SenderSettings {
+  senderCounterpartyRef: string;  // From Nova Poshta account
+  senderContactRef: string;
+  senderCityRef: string;
+  senderWarehouseRef: string;     // Default dispatch warehouse
+  senderPhone: string;
+  defaultWeight: number;          // Default package weight in kg
+  weightPerUnit: number;          // For weight calculation from item count
+  cargoDescription: string;       // Default description (e.g., "Товар")
+}
+```
+
+To find these refs, use the `Counterparty/getCounterparties` and `Address/getWarehouses` methods with your API key — or just look in the Nova Poshta account web UI and copy them.
+
+## What the Docs Don't Tell You
+
+**1. The API is slow**  
+City search takes 200-600ms. Warehouse search can take up to 1000ms. Design your UI with debounce (400ms minimum) and skeleton loaders.
+
+**2. Warehouse numbers change**  
+Nova Poshta renumbers branches occasionally. The `Ref` (UUID) is stable; the `Number` field is not. Store `Ref`, display `Number`.
+
+**3. Counterparty creation is idempotent(ish)**  
+If you create the same phone+name twice, Nova Poshta returns the existing counterparty. This is undocumented but consistent in practice. Treat it as a feature, not a bug.
+
+**4. The TTN date matters**  
+If you create a TTN with today's date past 18:00, the pickup gets scheduled for the next day. Consider time-zone-aware date logic if you're running a server in UTC.
+
+**5. Test API key limits**  
+The test environment (`api-sandbox.novaposhta.ua`) exists but is rarely updated and doesn't reflect all production behavior. Testing in production with real (but low-value) orders is standard practice in Ukrainian dev teams.
+
+**6. Ukrainian encoding**  
+All description fields accept Unicode. No need for transliteration. Ukrainian customers prefer Ukrainian text for "Опис вантажу" and recipient names. Don't default to Latin transliteration.
+
+## Frontend UX Patterns
+
+The checkout flow that works:
+
+1. **City field** — text input, debounced 400ms, shows top 8 results
+2. **Warehouse field** — disabled until city selected, shows type toggle (branch/poshtomat), numeric input routes to `WarehouseId` search
+3. **Both fields store Ref UUID, display Description** — never store the display string as the canonical value
+4. **Show shipping cost estimate** — call `getDocumentPrice` on city selection, display "~150₴" range
+5. **Track on thank-you page** — poll `/api/tracking?ttn=XXX` every 30s while on the page; link to Nova Poshta's own tracking for full history
+
+That's the integration. It's not complex once you understand the shape, but the gotchas — `DeliveryCity` vs `Ref`, the contact person two-fetch, `VolumeGeneral`, phone format — those are the parts that cost you hours. Now you don't have to learn them the hard way.
+
+---
+
+*Built this for [viatex.com.ua](https://viatex.com.ua) — a Ukrainian socks manufacturer. The codebase is React Router v7 + Drizzle ORM + SQLite.*
