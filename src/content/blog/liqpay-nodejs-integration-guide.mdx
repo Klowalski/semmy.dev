@@ -1,0 +1,423 @@
+---
+title: "LiqPay Integration in Node.js: The Missing English Guide"
+description: "LiqPay is Ukraine's dominant payment gateway, but its English documentation is sparse and full of traps. Here's the complete guide to integrating it in a production Node.js app — checkout flow, callback verification, sandbox mode, and every gotcha we hit."
+pubDate: 2026-02-19
+tags: ["payments", "nodejs", "ukraine", "typescript", "ecommerce"]
+---
+
+LiqPay processes the majority of card payments on Ukrainian e-commerce sites. If you're building for the Ukrainian market, you'll end up integrating it. The problem: the official documentation is incomplete, the English translation is machine-quality, and there are several non-obvious traps that will break your integration in production.
+
+This is the guide I wish existed when I built the LiqPay integration for [ecomlanding](https://github.com/SeMmyT/ecomlanding) — a production Ukrainian e-commerce platform. Real code, real gotchas.
+
+## How LiqPay Works
+
+LiqPay uses a data + signature pattern. Every request (checkout creation, callback verification) consists of:
+
+1. **data** — base64-encoded JSON payload
+2. **signature** — `base64(SHA1(private_key + data + private_key))`
+
+The signature scheme is simple but has one important implication: **your private key is sandwiched around the data on both sides**, not just appended. Get this wrong and every callback will fail signature verification.
+
+```typescript
+function generateSignature(data: string): string {
+  const signString = LIQPAY_PRIVATE_KEY + data + LIQPAY_PRIVATE_KEY;
+  return crypto.createHash("sha1").update(signString).digest("base64");
+}
+```
+
+This same function is used for both creating payment requests and verifying callbacks. Consistent and simple — but underdocumented.
+
+## Setting Up
+
+You need two API keys from LiqPay's dashboard (liqpay.ua/en/authorization):
+- `LIQPAY_PUBLIC_KEY` — sent with every request, safe to expose to the browser
+- `LIQPAY_PRIVATE_KEY` — stays server-side, never sent to the client
+
+```env
+LIQPAY_PUBLIC_KEY=sandbox_i123456789
+LIQPAY_PRIVATE_KEY=sandbox_AbCdEfGhIjKlMnOpQrStUvWxYz
+LIQPAY_SANDBOX=true
+```
+
+Enable sandbox mode during development — LiqPay has a proper sandbox environment with test card numbers (documented in their portal). Any payment in sandbox mode returns `status: "sandbox"` in callbacks, which you should treat the same as `status: "success"` for flow purposes.
+
+## The Payment Data Structure
+
+Here's the full TypeScript interface for what LiqPay expects:
+
+```typescript
+interface LiqPayPaymentData {
+  version: 3;               // Always 3
+  public_key: string;       // Your public key
+  action: "pay" | "hold" | "subscribe" | "paydonate";
+  amount: number;           // Decimal, e.g. 199.99
+  currency: "UAH" | "USD" | "EUR";
+  description: string;      // Shows on LiqPay checkout page
+  order_id: string;         // Your internal order ID (must be unique)
+  result_url?: string;      // Browser redirect after payment
+  server_url?: string;      // Server-side callback URL
+  sandbox?: 1;              // Enable sandbox (note: integer 1, not boolean)
+  language?: "uk" | "en" | "ru";
+  info?: string;            // Extra data — JSON string, returned in callback
+}
+```
+
+**Gotcha: `sandbox` is integer `1`, not boolean `true`**. The docs say "set to 1 to enable sandbox" but don't emphasize this. Sending `sandbox: true` breaks the request in some LiqPay versions.
+
+**Gotcha: `order_id` must be unique per payment attempt**. If you try to reuse an order ID (e.g., customer tries paying twice), LiqPay may reject it or process it incorrectly. Append a timestamp or retry counter: `order_id: "${orderId}-${Date.now()}"`.
+
+## Creating a Checkout
+
+The checkout flow: your server generates the data + signature, then either redirects the browser to LiqPay or returns JSON for the LiqPay embedded widget.
+
+```typescript
+export function createPaymentData(params: {
+  orderId: string;
+  amount: number;
+  description: string;
+  resultUrl?: string;   // Where to redirect the user after payment
+  serverUrl?: string;   // Your callback endpoint (server-to-server)
+}): { data: string; signature: string; checkoutUrl: string } {
+  const paymentData: LiqPayPaymentData = {
+    version: 3,
+    public_key: LIQPAY_PUBLIC_KEY,
+    action: "pay",
+    amount: params.amount,
+    currency: "UAH",
+    description: params.description,
+    order_id: params.orderId,
+    language: "uk",
+    result_url: params.resultUrl,
+    server_url: params.serverUrl,
+  };
+
+  if (LIQPAY_SANDBOX) {
+    paymentData.sandbox = 1;
+  }
+
+  const dataStr = JSON.stringify(paymentData);
+  const data = Buffer.from(dataStr).toString("base64");
+  const signature = generateSignature(data);
+
+  return {
+    data,
+    signature,
+    checkoutUrl: "https://www.liqpay.ua/api/3/checkout",
+  };
+}
+```
+
+### Option A: Auto-submit HTML form (redirect flow)
+
+The simplest approach — return an HTML page that auto-submits a form to LiqPay's checkout URL:
+
+```typescript
+export function getCheckoutRedirectHTML(params: CheckoutParams): string {
+  const { data, signature, checkoutUrl } = createPaymentData(params);
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>Redirecting to LiqPay...</title>
+    </head>
+    <body>
+      <form id="liqpay-form" method="POST" action="${checkoutUrl}" accept-charset="utf-8">
+        <input type="hidden" name="data" value="${data}" />
+        <input type="hidden" name="signature" value="${signature}" />
+        <noscript>
+          <button type="submit">Proceed to payment</button>
+        </noscript>
+      </form>
+      <p>Redirecting to payment...</p>
+      <script>document.getElementById('liqpay-form').submit();</script>
+    </body>
+    </html>
+  `;
+}
+```
+
+### Option B: Embedded widget (JSON API)
+
+LiqPay has an embedded JavaScript widget that shows the payment form in an iframe on your site. For this, return the data + signature as JSON:
+
+```typescript
+// API endpoint
+if (request.headers.get("Accept")?.includes("application/json")) {
+  const { data, signature } = createPaymentData(params);
+  return Response.json({ data, signature });
+}
+```
+
+Then on the client:
+
+```html
+<script src="https://static.liqpay.ua/libjs/sdk_button.js"></script>
+<div id="liqpay-checkout"></div>
+<script>
+  LiqPayCheckoutCallback = function() {
+    LiqPayCheckout.init({
+      data: "{{ data }}",
+      signature: "{{ signature }}",
+      embedTo: "#liqpay-checkout",
+      language: "uk",
+      mode: "embed"  // or "popup"
+    });
+  };
+</script>
+```
+
+**Which to use?** The redirect flow is simpler and more reliable. The embedded widget has CSP issues if you have a strict Content Security Policy (you need to allowlist several LiqPay domains). For a production store with PCI compliance concerns, the redirect is cleaner — the card data never touches your origin.
+
+## The Callback Handler
+
+When a payment completes (success or failure), LiqPay sends a POST to your `server_url` with form-encoded data:
+
+```
+data=<base64 encoded JSON>
+signature=<sha1 signature>
+```
+
+**Critical: LiqPay sends `Content-Type: application/x-www-form-urlencoded`.** Parse with `request.formData()`, not `request.json()`.
+
+```typescript
+export async function action({ request }: Route.ActionArgs) {
+  const formData = await request.formData();
+  const dataParam = formData.get("data") as string;
+  const signature = formData.get("signature") as string;
+
+  // Step 1: Verify signature before touching anything
+  if (!verifyCallback(dataParam, signature)) {
+    console.error("LiqPay callback: Invalid signature — possible replay attack");
+    return new Response("INVALID", { status: 401 });
+  }
+
+  // Step 2: Decode and parse the data
+  const decoded = Buffer.from(dataParam, "base64").toString("utf-8");
+  const callbackData: LiqPayCallbackData = JSON.parse(decoded);
+
+  const { order_id, status, transaction_id } = callbackData;
+  console.log(`LiqPay callback: order=${order_id}, status=${status}`);
+
+  // Step 3: Handle by status
+  if (isPaymentSuccessful(status)) {
+    await markOrderPaid(order_id, transaction_id.toString());
+    await sendConfirmationEmail(order_id);
+  } else if (status === "reversed") {
+    await markOrderRefunded(order_id);
+  } else if (isPaymentFailed(status)) {
+    await markOrderPaymentFailed(order_id);
+  }
+  // "processing", "wait_accept", etc. — ignore, wait for final callback
+
+  // Step 4: Return OK
+  // LiqPay retries if it doesn't get 200 OK within ~30 seconds
+  return new Response("OK", { status: 200 });
+}
+```
+
+## Payment Status Reference
+
+The callback contains a `status` field. Here's what each value means in practice:
+
+```typescript
+export type LiqPayStatus =
+  | "success"      // Payment confirmed — money captured
+  | "sandbox"      // Same as success, but in sandbox mode
+  | "failure"      // Payment declined
+  | "error"        // Technical error (treat like failure)
+  | "reversed"     // Refund processed
+  | "processing"   // Payment initiated, not yet confirmed
+  | "wait_accept"  // Merchant must manually accept (hold flow)
+  | "wait_card"    // Customer hasn't entered card details yet
+  | "wait_secure"  // Awaiting 3DS authentication
+  | "subscribed"   // Recurring subscription created
+  | "unsubscribed" // Subscription cancelled
+  ;
+
+function isPaymentSuccessful(status: LiqPayStatus): boolean {
+  return status === "success" || status === "sandbox";
+}
+
+function isPaymentPending(status: LiqPayStatus): boolean {
+  return ["processing", "wait_accept", "wait_card", "wait_secure"].includes(status);
+}
+
+function isPaymentFailed(status: LiqPayStatus): boolean {
+  return status === "failure" || status === "error";
+}
+```
+
+**Important:** LiqPay may call your `server_url` multiple times for the same order as the status progresses. You'll often get `wait_secure` → `processing` → `success`. Make your handler idempotent — check current status before updating, or use the `transaction_id` as a deduplication key.
+
+## The `result_url` vs `server_url` Distinction
+
+This trips up a lot of integrations:
+
+- **`server_url`** — Called server-to-server by LiqPay's servers. Use this to update your database. Guaranteed delivery (LiqPay retries on failure). **This is where you trust payment status.**
+- **`result_url`** — Where the user's browser is redirected after payment. May contain data + signature in query params, but **don't rely on this for payment confirmation**. The user might close the tab, the redirect might fail, or they might modify query params.
+
+In practice: update DB in `server_url` handler, redirect user in `result_url` handler based on current DB state (not LiqPay params).
+
+```typescript
+// result_url GET handler — show result to user
+export async function loader({ request }: Route.LoaderArgs) {
+  const url = new URL(request.url);
+  const orderId = url.searchParams.get("orderId");
+
+  // Look up DB state — don't trust URL params for business logic
+  const order = await db.query.orders.findFirst({
+    where: eq(orders.orderNumber, orderId),
+  });
+
+  if (order?.paymentStatus === "paid") {
+    return redirect(`/thank-you?order=${orderId}&payment=success`);
+  } else {
+    return redirect(`/thank-you?order=${orderId}&payment=pending`);
+  }
+}
+```
+
+## Sandbox Testing
+
+Enable sandbox mode with `LIQPAY_SANDBOX=true`. LiqPay provides test cards in their portal — the main ones:
+
+| Card | Result |
+|------|--------|
+| 4242 4242 4242 4242 | Success |
+| 4000 0000 0000 0002 | Declined |
+| 4000 0025 0000 3155 | 3DS Required |
+
+Test card expiry: any future date. CVV: any 3 digits.
+
+**Gotcha: sandbox callbacks still go to your real `server_url`**. LiqPay's servers must be able to reach your endpoint. During local development, use ngrok or a tool like localtunnel. The LiqPay dashboard doesn't have a "test callback" button — you need a real reachable URL.
+
+**Gotcha: sandbox status**. In sandbox mode, successful payments return `status: "sandbox"`, not `status: "success"`. Make sure your `isPaymentSuccessful()` handles both:
+
+```typescript
+function isPaymentSuccessful(status: LiqPayStatus): boolean {
+  return status === "success" || status === "sandbox";
+}
+```
+
+## Security: Replay Attacks
+
+The signature only verifies the data came from LiqPay — it doesn't prevent replaying old callbacks. If an attacker captures a successful callback, they could replay it for a different order.
+
+LiqPay doesn't include a timestamp in callbacks, so standard timestamp-window protection isn't available. Protect against replays with idempotency keys:
+
+```sql
+-- Track processed transaction IDs
+CREATE TABLE processed_liqpay_callbacks (
+  transaction_id TEXT PRIMARY KEY,
+  order_id       TEXT NOT NULL,
+  status         TEXT NOT NULL,
+  processed_at   INTEGER NOT NULL DEFAULT (unixepoch())
+);
+```
+
+```typescript
+async function handleCallback(callbackData: LiqPayCallbackData) {
+  const { transaction_id, order_id, status } = callbackData;
+  const txId = transaction_id.toString();
+
+  // Check if already processed
+  const existing = await db.query.processedLiqpayCallbacks.findFirst({
+    where: eq(processedLiqpayCallbacks.transactionId, txId),
+  });
+
+  if (existing) {
+    console.log(`Duplicate callback for transaction ${txId} — skipping`);
+    return; // Return 200 so LiqPay doesn't retry
+  }
+
+  // Process and record atomically
+  await db.transaction(async (tx) => {
+    await updateOrderPaymentStatus(tx, order_id, status);
+    await tx.insert(processedLiqpayCallbacks).values({
+      transactionId: txId,
+      orderId: order_id,
+      status,
+      processedAt: Math.floor(Date.now() / 1000),
+    });
+  });
+}
+```
+
+## Currency and Amounts
+
+LiqPay amounts are decimal numbers in the specified currency. UAH payments must use kopecks-aware precision:
+
+```typescript
+// ✅ Correct — 199.99 UAH
+amount: 199.99
+
+// ❌ Wrong — don't use string
+amount: "199.99"
+
+// ✅ For integer amounts
+amount: 200  // 200.00 UAH
+```
+
+If you store prices as integers (kopecks/cents), convert before sending:
+
+```typescript
+const amountInUAH = priceInKopecks / 100;
+```
+
+The callback returns the same `amount` you sent, which is useful for verification.
+
+## The Embedded Widget CSP Issue
+
+If you use the embedded widget and have a Content Security Policy, you'll need to allowlist:
+
+```
+Content-Security-Policy:
+  script-src https://static.liqpay.ua;
+  frame-src https://www.liqpay.ua;
+  connect-src https://www.liqpay.ua;
+  img-src https://static.liqpay.ua;
+```
+
+The redirect flow avoids all of this — the payment page is served from LiqPay's domain entirely.
+
+## Production Checklist
+
+Before going live:
+
+- [ ] Switch to production API keys (not sandbox)
+- [ ] Set `LIQPAY_SANDBOX=false`
+- [ ] Ensure `server_url` is reachable from the internet (not localhost)
+- [ ] Test with real test cards (LiqPay support can provide live test mode)
+- [ ] Implement idempotency for callback handler
+- [ ] Log all callback payloads for debugging
+- [ ] Verify SHA1 signature on every callback — reject anything that fails
+- [ ] Test the `reversed` (refund) flow
+- [ ] Make sure `result_url` redirect works even when callback hasn't fired yet (async gap)
+- [ ] Add monitoring/alerting on callback errors
+
+## What LiqPay Doesn't Do
+
+To set expectations:
+
+- **No webhook events for refunds you initiate** — if you refund via API, there's no server callback confirming it. You need to poll or trust the API response.
+- **No webhook signature rotation** — the private key is permanent; protect it accordingly.
+- **No native recurring/subscription API in English docs** — it exists (`action: "subscribe"`) but documentation is Ukrainian-only.
+- **No native support for split payments or marketplace flows** — for those, look at IBOX or Fondy.
+
+## Alternatives to Consider
+
+If LiqPay doesn't fit your needs:
+
+- **Fondy** — Better docs, supports more currencies, good for international businesses operating in Ukraine
+- **Wayforpay** — Another common Ukrainian gateway, similar API style
+- **Stripe** — Not available in Ukraine for Ukrainian legal entities, but foreign companies can use it for UAH-priced products
+
+For most Ukrainian e-commerce, LiqPay is the pragmatic choice: it's what customers recognize, has good bank coverage, and integrates with existing Ukrainian banking infrastructure including Monobank and Privat24.
+
+---
+
+The full implementation used in this post is in [ecomlanding](https://github.com/SeMmyT/ecomlanding) — `app/lib/services/liqpay.ts` is the service layer, `app/routes/api.liqpay.checkout.ts` and `app/routes/api.liqpay.callback.ts` are the endpoints.
+
+If you're building for the Ukrainian market and hit something this guide doesn't cover, open an issue on the repo.
