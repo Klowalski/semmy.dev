@@ -1,0 +1,428 @@
+---
+title: "Hono Middleware Composition in Production: Context Typing, Chaining, and Tenant Isolation"
+description: "How to build layered Hono middleware that carries type-safe context through tenant resolution, auth, logging, and admin guards — with real production code."
+pubDate: 2026-02-19
+tags: ["hono", "typescript", "middleware", "multi-tenant", "node.js"]
+---
+
+Hono's middleware system is deceptively simple. You get a `(c, next) => Promise<void>` signature and a `c.set()` / `c.get()` context bag. But when you have four or five middleware layers that need to share state — and you want TypeScript to know what's in that bag — it gets non-trivial fast.
+
+This is what I learned building [govantazh](https://github.com/SeMmyT/govantazh), a multi-tenant logistics SaaS with Hono, Kysely, and per-tenant SQLite databases. The middleware stack handles: tenant resolution → database injection → request logging → session auth → admin guard. Each layer depends on the previous. TypeScript knows about all of it.
+
+---
+
+## The Problem: `c.get()` Returns `unknown` by Default
+
+Hono's context is a generic: `Context<{Variables: ...}>`. Without type parameters, `c.get('anything')` returns `unknown`. You can cast with `as`, but then you lose the safety net.
+
+The pattern that works: define a `Variables` type for each middleware, export it, and compose them into an intersection type for downstream middleware.
+
+```ts
+// tenant.ts
+export type TenantVariables = {
+  tenantId: string;
+  db: Kysely<Database>;
+};
+
+// auth.ts — depends on TenantVariables (needs db)
+export type AuthVariables = TenantVariables & {
+  userId: string;
+  userEmail: string;
+  isAdmin: boolean;
+};
+```
+
+Each middleware declares what it adds. The intersection carries everything forward.
+
+---
+
+## Layer 1: Tenant Resolution
+
+The first middleware figures out which tenant we're dealing with and injects a database connection. Govantazh uses per-tenant SQLite — each company gets its own database file. The middleware extracts the tenant from the subdomain (or an env var in dev):
+
+```ts
+import { createMiddleware } from 'hono/factory';
+import { createDb } from '@govantazh/db';
+import { isValidTenant } from '../lib/tenant-registry.js';
+
+export type TenantVariables = {
+  tenantId: string;
+  db: Kysely<Database>;
+};
+
+export const tenantMiddleware = createMiddleware<{
+  Variables: TenantVariables;
+}>(async (c, next) => {
+  // Dev: use TENANT_ID env var
+  let tenantId = process.env.TENANT_ID;
+
+  if (!tenantId) {
+    // Production: extract from subdomain (acme.govantazh.com → "acme")
+    const host = c.req.header('host') || '';
+    const match = host.match(/^([^.]+)\.govantazh\.com/);
+    if (match) tenantId = match[1];
+  }
+
+  if (!tenantId) {
+    return c.json({ error: 'Tenant not found' }, 400);
+  }
+
+  if (!isValidTenant(tenantId)) {
+    return c.text('Unknown tenant', 404);
+  }
+
+  c.set('tenantId', tenantId);
+  c.set('db', createDb(tenantId));  // opens/reuses cached Kysely connection
+  await next();
+});
+```
+
+`createDb(tenantId)` returns a cached Kysely instance — it doesn't open a new connection on every request. The database file is at `~/.govantazh/tenants/{tenantId}.sqlite`.
+
+**Why do tenant resolution first?** Because everything else — auth, logging, the route handler — needs the database. If we can't determine the tenant, nothing works. Fail fast at the edge.
+
+---
+
+## Layer 2: Structured Request Logging
+
+The logger middleware runs second, before auth. It needs to log the request start time immediately, then enrich the log entry on completion with the tenant/user context that auth middleware sets later.
+
+This is the tricky part: the logger wraps the entire downstream chain, so it can capture context that middleware further down in the chain sets.
+
+```ts
+import { createMiddleware } from 'hono/factory';
+import { randomUUID } from 'node:crypto';
+import { createRequestLogger } from '../lib/logger.js';
+import type pino from 'pino';
+
+export type LoggerVariables = {
+  requestId: string;
+  log: pino.Logger;
+};
+
+export const requestLoggerMiddleware = createMiddleware<{
+  Variables: TenantVariables & LoggerVariables & {
+    userId?: string;    // optional — may be set by auth middleware below
+    userEmail?: string;
+    isAdmin?: boolean;
+  };
+}>(async (c, next) => {
+  const requestId = randomUUID();
+  const start = Date.now();
+
+  const log = createRequestLogger({
+    request_id: requestId,
+    method: c.req.method,
+    path: c.req.path,
+  });
+
+  c.set('requestId', requestId);
+  c.set('log', log);
+  c.header('x-request-id', requestId);
+
+  log.info('request_started');
+
+  try {
+    await next(); // downstream middleware + route handler runs here
+  } catch (err) {
+    const duration_ms = Date.now() - start;
+    log.error({
+      msg: 'request_failed',
+      status: 500,
+      duration_ms,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    throw err; // re-throw so Hono's error handler kicks in
+  }
+
+  const duration_ms = Date.now() - start;
+  const status = c.res.status;
+
+  // By now, auth middleware has run — we can enrich the log entry
+  const tenantId = c.get('tenantId');
+  const userId = c.get('userId');
+
+  const logWithContext = log.child({
+    ...(tenantId ? { tenant_id: tenantId } : {}),
+    ...(userId ? { user_id: userId } : {}),
+  });
+
+  const entry = { msg: 'request_completed', status, duration_ms };
+  if (status >= 500) logWithContext.error(entry);
+  else if (status >= 400) logWithContext.warn(entry);
+  else logWithContext.info(entry);
+});
+```
+
+The key insight: `await next()` suspends the logger, runs everything below it (auth, route handler), then resumes. At the resume point, all the context set by downstream middleware is available via `c.get()`.
+
+This is how Koa-style middleware composition works in Hono. It's an onion — each layer wraps everything inside it.
+
+---
+
+## Layer 3: Auth (Session Cookie Validation)
+
+Auth runs after the logger. It needs `db` (from tenant middleware) to validate the session. It sets `userId`, `userEmail`, and `isAdmin` into context — which the logger then reads for structured log output.
+
+```ts
+export type AuthVariables = TenantVariables & {
+  userId: string;
+  userEmail: string;
+  isAdmin: boolean;
+};
+
+export const authMiddleware = createMiddleware<{
+  Variables: AuthVariables;
+}>(async (c, next) => {
+  const sessionId = getCookie(c, 'session_id');
+
+  if (!sessionId) {
+    return c.json({ error: 'Unauthorized', message: 'No session cookie' }, 401);
+  }
+
+  const db = c.get('db'); // TypeScript knows this is Kysely<Database>
+
+  const userId = await validateSession(db, sessionId);
+  if (!userId) {
+    return c.json({ error: 'Unauthorized', message: 'Invalid or expired session' }, 401);
+  }
+
+  const user = await db
+    .selectFrom('users')
+    .selectAll()
+    .where('id', '=', userId)
+    .executeTakeFirst();
+
+  if (!user) {
+    return c.json({ error: 'Unauthorized', message: 'User not found' }, 401);
+  }
+
+  c.set('userId', user.id);
+  c.set('userEmail', user.email);
+  c.set('isAdmin', user.is_admin === 1);
+
+  await next();
+});
+```
+
+Note that `c.get('db')` is typed correctly here because `AuthVariables` extends `TenantVariables`. TypeScript knows `db` is `Kysely<Database>`, not `unknown`.
+
+---
+
+## Layer 4: Admin Guard
+
+The admin guard is tiny — it just checks a flag set by auth middleware:
+
+```ts
+export const adminMiddleware = createMiddleware<{
+  Variables: AuthVariables;
+}>(async (c, next) => {
+  if (!c.get('isAdmin')) {
+    return c.json({ error: 'Forbidden', message: 'Admin access required' }, 403);
+  }
+  await next();
+});
+```
+
+This must be applied **after** `authMiddleware` — it would throw or return wrong data otherwise. More on ordering below.
+
+---
+
+## Composing the Stack
+
+There are two places to apply middleware: globally (on the app), or per-route-group.
+
+```ts
+import { Hono } from 'hono';
+import { tenantMiddleware } from './middleware/tenant.js';
+import { requestLoggerMiddleware } from './middleware/request-logger.js';
+import { authMiddleware, adminMiddleware } from './middleware/auth.js';
+
+const app = new Hono();
+
+// Global: all routes
+app.use('*', tenantMiddleware);
+app.use('*', requestLoggerMiddleware);
+
+// Auth required: /api/* routes
+app.use('/api/*', authMiddleware);
+
+// Admin only: /api/admin/* routes
+app.use('/api/admin/*', adminMiddleware);
+
+// Route handlers
+app.get('/api/cargos', async (c) => {
+  const db = c.get('db');      // Kysely<Database> ✓
+  const userId = c.get('userId'); // string ✓
+  // ...
+});
+
+app.get('/api/admin/tenants', async (c) => {
+  const isAdmin = c.get('isAdmin'); // boolean ✓
+  // ...
+});
+```
+
+The `Variables` types flow correctly here because the middleware generics propagate. In practice you may need to annotate route handlers explicitly when the type inference gets complex — but the middleware types do the heavy lifting.
+
+---
+
+## Middleware Ordering Matters
+
+The onion model means order is everything:
+
+```
+Request →
+  tenantMiddleware (resolves tenant, injects db)
+    → requestLoggerMiddleware (logs start, wraps rest)
+        → authMiddleware (validates session, injects user)
+            → adminMiddleware (checks isAdmin flag)
+                → route handler
+            ← adminMiddleware (nothing to do on exit)
+        ← authMiddleware (nothing to do on exit)
+    ← requestLoggerMiddleware (logs completion with tenant+user context)
+← tenantMiddleware (nothing to do on exit)
+```
+
+If you swap logger and auth, the logger can't capture user context in the completion log (it runs before auth sets it). If you swap tenant and auth, auth has no `db` to validate the session with.
+
+Hono applies `app.use()` middleware in registration order. Route-specific middleware runs in order too: `route.get('/path', middleware1, middleware2, handler)`.
+
+---
+
+## Public vs Protected Routes
+
+Not every route needs auth. Govantazh has a few patterns:
+
+**Fully public** (just tenant context):
+```ts
+app.get('/api/health', (c) => c.json({ ok: true }));
+app.post('/api/auth/login', loginHandler);
+```
+
+**Auth required** (most API routes):
+```ts
+app.use('/api/*', authMiddleware);
+app.get('/api/cargos', cargosHandler);
+```
+
+**Admin only**:
+```ts
+app.use('/api/admin/*', authMiddleware);
+app.use('/api/admin/*', adminMiddleware);
+app.get('/api/admin/tenants', adminTenantsHandler);
+```
+
+**Internal (service-to-service)** — different auth, no session cookie:
+```ts
+// Internal routes use a shared secret, not user sessions
+app.use('/internal/*', internalAuthMiddleware);
+app.post('/internal/driver-location', driverLocationHandler);
+```
+
+The `/internal/*` prefix uses `Authorization: Bearer {INTERNAL_SECRET}` instead of cookies. This lets the mobile driver app post location without session management.
+
+---
+
+## Getting Context in Route Handlers
+
+Within a route handler, TypeScript knows the context variables if you type the Hono app correctly:
+
+```ts
+// Typed Hono app
+type Env = {
+  Variables: AuthVariables & LoggerVariables;
+};
+
+const app = new Hono<Env>();
+
+app.get('/api/cargos', async (c) => {
+  const db = c.get('db');          // Kysely<Database>
+  const userId = c.get('userId');  // string
+  const log = c.get('log');        // pino.Logger
+  
+  log.info({ user_id: userId }, 'fetching cargos');
+  
+  const cargos = await db
+    .selectFrom('cargos')
+    .selectAll()
+    .where('assigned_driver_id', '=', userId)
+    .execute();
+  
+  return c.json(cargos);
+});
+```
+
+The `Env` type parameter on `Hono<Env>` tells TypeScript what variables are available. Without it, `c.get()` returns `unknown` on every call.
+
+---
+
+## Error Handling Middleware
+
+One more useful layer: global error handling. In Hono, unhandled errors surface via `app.onError`:
+
+```ts
+app.onError((err, c) => {
+  const log = c.get('log'); // may be undefined if error is pre-logger
+  const requestId = c.get('requestId') || 'unknown';
+  
+  if (log) {
+    log.error({
+      msg: 'unhandled_error',
+      error: err.message,
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
+    });
+  } else {
+    console.error('Unhandled error (pre-logger):', err);
+  }
+  
+  return c.json({
+    error: 'Internal Server Error',
+    requestId,
+  }, 500);
+});
+```
+
+The `log` check is important — if the error happens during tenant or logger middleware (before logging is set up), `c.get('log')` is undefined.
+
+---
+
+## What I'd Change in Hindsight
+
+**1. Use `createFactory` for routes that share middleware.** Instead of applying middleware per-route-group with `app.use()`, define a route factory with the middleware baked in:
+
+```ts
+// Typed factory with auth baked in
+const factory = createFactory<{ Variables: AuthVariables & LoggerVariables }>();
+
+const authRoute = factory.createHandlers(authMiddleware);
+
+// Use like:
+app.get('/api/cargos', ...authRoute, (c) => { /* c is fully typed */ });
+```
+
+This is more composable than global `app.use()` globs.
+
+**2. Validate env at startup, not per-request.** The `TENANT_ID` env var check runs on every request in dev. Better to validate once on app start and fail fast if it's missing.
+
+**3. Rate limiting as middleware.** Right now rate limiting in govantazh is done inline in route handlers. It should be a middleware layer that runs before auth (to protect the auth endpoint itself).
+
+---
+
+## Summary
+
+Hono middleware composition in production:
+
+- Use `createMiddleware<{ Variables: ... }>()` for type-safe context
+- Export `Variables` types and compose via intersection types
+- Middleware registration order = onion execution order
+- The logger wraps auth so it can capture user context in the completion log
+- `Hono<{ Variables: ... }>` propagates types to route handlers
+- Global `app.use()` + prefix-based guards work well for most apps
+- `app.onError()` for graceful handling of uncaught middleware errors
+
+The full middleware stack adds maybe 2-3ms per request (tenant DB lookup + session validation from SQLite). Acceptable for a logistics app. For higher-scale workloads, cache the session validation result in Redis.
+
+---
+
+*Code from [govantazh](https://github.com/SeMmyT/govantazh) — a real multi-tenant logistics SaaS built with Hono, Kysely, and SQLite. Source is public if you want to dig through it.*
