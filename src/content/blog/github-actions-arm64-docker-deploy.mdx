@@ -1,0 +1,251 @@
+---
+title: "GitHub Actions for ARM64 Docker Deploys: The Setup That Actually Works"
+description: "Building ARM64 Docker images in CI, pushing to Docker Hub, and SSH-deploying to a Hetzner VPS — with Telegram notifications and TypeScript checks on every push."
+pubDate: 2026-02-19
+tags: ["docker", "github-actions", "cicd", "arm64", "devops", "vps"]
+---
+
+For four days, my production Docker image sat undeployed. The code was done. The image was built. But deploying meant SSH-ing into the server, running two commands, watching the logs. And I kept not doing it.
+
+That's the gap. Between "build ready" and "deploy done" is where things rot.
+
+So I wired up GitHub Actions to close that gap permanently. Here's what actually works for an ARM64 VPS — and what doesn't.
+
+## The Architecture
+
+My setup:
+- Hetzner VPS running ARM64 (AArch64) Ubuntu
+- Docker Compose managing a Node.js / React Router app
+- Docker Hub for image registry
+- GitHub Actions for CI/CD
+
+The workflow: push to `main` → build ARM64 image → push to Docker Hub → SSH into server → pull and recreate container.
+
+Simple. But there are a few places where it goes wrong.
+
+## The ARM64 Problem
+
+If you build your Docker image on GitHub Actions without thinking about it, you'll get an `amd64` image. When you pull it on an ARM64 server, Docker will either refuse or run it under QEMU emulation — slow and fragile.
+
+The fix is `docker/setup-qemu-action` + `docker/setup-buildx-action`:
+
+```yaml
+- name: Set up QEMU
+  uses: docker/setup-qemu-action@v3
+
+- name: Set up Docker Buildx
+  uses: docker/setup-buildx-action@v3
+
+- name: Build and push
+  uses: docker/build-push-action@v5
+  with:
+    context: .
+    platforms: linux/arm64
+    push: true
+    tags: ${{ secrets.DOCKERHUB_USERNAME }}/myapp:latest
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
+```
+
+The `platforms: linux/arm64` is the key line. Without it, you ship an amd64 image.
+
+The `cache-from/cache-to: type=gha` enables GitHub Actions layer caching — subsequent builds only rebuild changed layers. For a Node.js app, this means the npm install layer is usually cached.
+
+## The Full Workflow
+
+Here's the complete `deploy.yml`:
+
+```yaml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/myapp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: root
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          script: |
+            cd /root/myapp
+            docker compose pull
+            docker compose up -d --force-recreate
+            docker image prune -f
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="✅ Deployed myapp to production (commit: ${{ github.sha }})"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="❌ Deploy failed for myapp (commit: ${{ github.sha }})"
+```
+
+## The TypeScript CI Check
+
+Separate from deploy — you want a CI check that runs on every push (including PRs), not just main:
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript check
+        run: npx tsc --noEmit
+```
+
+This catches broken TypeScript before it hits the deploy pipeline. If types are wrong, CI fails, deploy never runs.
+
+## Required GitHub Secrets
+
+Go to `Settings → Secrets and variables → Actions` and add:
+
+| Secret | Where to get it |
+|--------|----------------|
+| `DOCKERHUB_USERNAME` | Your Docker Hub username |
+| `DOCKERHUB_TOKEN` | Docker Hub → Account Settings → Security → Access Tokens |
+| `SERVER_HOST` | Your server IP |
+| `SERVER_SSH_KEY` | Private key contents (`~/.ssh/id_ed25519` on server) |
+| `TELEGRAM_BOT_TOKEN` | BotFather |
+| `TELEGRAM_CHAT_ID` | `@userinfobot` or check your existing bot logs |
+
+The `SERVER_SSH_KEY` is the private key that corresponds to an authorized key on your server. If you want least-privilege, create a deploy key specifically for this purpose rather than using your root key.
+
+## The `--force-recreate` Flag
+
+On the server, use `--force-recreate`, not just `up -d`:
+
+```bash
+docker compose pull
+docker compose up -d --force-recreate
+```
+
+Without `--force-recreate`, Docker Compose only recreates containers if the image changed. But since you're pulling `:latest`, Docker might cache the old image digest and skip recreation. `--force-recreate` ensures the container is always rebuilt from the fresh pull.
+
+The `docker image prune -f` at the end removes dangling images (the old `:latest` after the new one is pulled). Otherwise your server fills up with old image layers over time.
+
+## The Stale Image Trap (Why This Matters)
+
+Before CI/CD, my workflow was:
+1. Build image locally
+2. Tag it
+3. SSH to server
+4. Run two commands
+
+That gap — between "locally ready" and "actually deployed" — is where everything diverges. Your database schema changes. Your code patches pile up. The image you built on Tuesday is different from what you need to deploy on Friday.
+
+With CI/CD, the gap closes to zero. Merge to main = deployed. The image in production is always exactly what's in the repo.
+
+For a solo developer, this feels like overkill. It's not. The mental overhead of manual deploys accumulates. The hesitation to deploy ("I'll do it later") turns into days. Automate it once, and deploying becomes as natural as pushing.
+
+## What About `docker-compose.yml` on the Server?
+
+Your `docker-compose.yml` on the server should pull the image, not build it:
+
+```yaml
+services:
+  app:
+    image: yourusername/myapp:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+```
+
+No `build:` key — just `image:`. The CI builds the image; the server just runs it. Separation of concerns.
+
+## Build Time
+
+First build with QEMU cross-compilation on GitHub Actions: ~10-15 minutes for a Node.js app with native modules (`better-sqlite3`).
+
+With layer caching: ~3-4 minutes (only rebuilds changed layers).
+
+With `--no-cache`: ~12 minutes.
+
+The GitHub Actions layer cache (`type=gha`) persists across runs in the same repo. It's scoped to the branch, so `main` has its own cache.
+
+## Monitoring After Deploy
+
+The Telegram notifications are basic but effective. You get:
+- ✅ success with commit SHA (you can check what shipped)
+- ❌ failure with commit SHA (you know exactly which commit broke it)
+
+For more visibility, you could add `docker logs` output to the notification, or a health check curl after the deploy:
+
+```bash
+# Add to the SSH deploy script
+sleep 10  # Wait for container to start
+curl -f http://localhost:3000/health || exit 1
+```
+
+If the health check fails, the step fails, Telegram fires the failure notification, and you know before users do.
+
+## The Payoff
+
+Four days of a stale deployment. One workflow file. Now every push to main auto-deploys in ~4 minutes with notification.
+
+The time cost to set this up: about 45 minutes (mostly reading docs about ARM64 cross-compilation). The time saved on every future deploy: 5 minutes. Breakeven: 9 deploys. I'll hit that within a week.
+
+Automate your deploy pipeline once. You'll never manually SSH-and-docker-run again.
