@@ -1,0 +1,279 @@
+---
+title: "One Database Per Tenant: Why I Chose It and What I Learned"
+description: "Most multi-tenant guides push shared databases. Here's why I went with per-tenant SQLite files, how it simplified my architecture, and what it broke."
+pubDate: 2026-02-19
+tags: ["sqlite", "multi-tenant", "saas", "architecture", "hono"]
+---
+
+When I started building govantazh — a logistics SaaS for Ukrainian freight brokers — I had a standard multi-tenant decision to make. Every tutorial says the same thing: shared database, discriminate rows by `tenant_id`. It's the "right" way.
+
+I went the other direction. One SQLite file per tenant.
+
+Six months later, I'm glad I did. Here's what happened.
+
+## The Problem with Shared Databases
+
+The shared-database approach has one primary virtue: simplicity at the start. You have one schema, one migration path, one connection pool.
+
+The problems emerge later:
+
+**Cross-tenant data leaks.** Every query needs a `WHERE tenant_id = ?` guard. Miss one join, forget one filter — you're leaking data between clients. I've seen production incidents caused by exactly this. It's a class of bug that's easy to write and hard to test for exhaustively.
+
+**Schema changes affect everyone simultaneously.** One tenant wants a custom field. Another needs different business logic. In a shared schema, you're adding nullable columns for everyone, or building a metadata blob hack, or splitting tables by feature flag.
+
+**Performance isolation is nearly impossible.** One tenant runs a heavy report at 3 AM. Everyone else slows down. Connection pooling, query timeouts, and index tuning all have to serve the global traffic mix.
+
+**Backups are all-or-nothing.** Restoring one tenant's data means restoring the entire database, then surgically extracting and re-importing rows. In a freight brokerage context where "where's my shipment?" is an urgent question, that's not acceptable.
+
+## Why SQLite Per Tenant Works Here
+
+govantazh manages logistics for 4–8 freight brokers. Each tenant is a separate business with their own drivers, orders, clients, and financial data. There's zero reason their data should share physical storage.
+
+The architecture is simple:
+
+```
+data/
+  proexpedite/
+    tenant.db
+    .env
+    docker-compose.yml
+  maxcargo/
+    tenant.db
+    .env
+    docker-compose.yml
+  smartway/
+    tenant.db
+    .env
+```
+
+Each `tenant.db` is a complete SQLite database with the full schema. Each tenant's services run in their own Docker Compose stack. The shared API knows which tenant it's serving from the subdomain (`proexpedite.govantazh.app`) or JWT claim.
+
+## The Connection Layer
+
+In Hono, tenant routing looks like this:
+
+```typescript
+// middleware/tenant.ts
+import Database from "better-sqlite3";
+import path from "path";
+
+const connections = new Map<string, Database.Database>();
+
+export function getTenantDb(tenantId: string): Database.Database {
+  if (!connections.has(tenantId)) {
+    const dbPath = path.join(process.env.DATA_DIR!, tenantId, "tenant.db");
+    const db = new Database(dbPath);
+    
+    // WAL mode for better concurrent read performance
+    db.pragma("journal_mode = WAL");
+    db.pragma("foreign_keys = ON");
+    db.pragma("synchronous = NORMAL");
+    
+    connections.set(tenantId, db);
+  }
+  
+  return connections.get(tenantId)!;
+}
+
+// Route middleware
+app.use("*", async (c, next) => {
+  const tenantId = c.req.header("X-Tenant-ID") 
+    ?? extractFromJWT(c.req.header("Authorization"));
+  
+  if (!tenantId || !isValidTenant(tenantId)) {
+    return c.json({ error: "Unknown tenant" }, 403);
+  }
+  
+  c.set("db", getTenantDb(tenantId));
+  c.set("tenantId", tenantId);
+  await next();
+});
+```
+
+No `WHERE tenant_id = ?` anywhere in business logic. The database file *is* the tenant boundary.
+
+## Migrations: The Hard Part
+
+With shared databases, you run migrations once. With per-tenant databases, you run them once per tenant. That's a different problem.
+
+My migration runner:
+
+```typescript
+// scripts/migrate.ts
+import { readdirSync } from "fs";
+import path from "path";
+import Database from "better-sqlite3";
+
+const DATA_DIR = process.env.DATA_DIR!;
+
+function getTenants(): string[] {
+  return readdirSync(DATA_DIR, { withFileTypes: true })
+    .filter(d => d.isDirectory())
+    .map(d => d.name)
+    .filter(name => name !== "dev" || process.env.INCLUDE_DEV);
+}
+
+function getMigrations(): string[] {
+  return readdirSync("./migrations")
+    .filter(f => f.endsWith(".sql"))
+    .sort(); // Important: lexicographic order = chronological
+}
+
+function runMigrations(tenantId: string): void {
+  const dbPath = path.join(DATA_DIR, tenantId, "tenant.db");
+  const db = new Database(dbPath);
+  
+  // Track applied migrations
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      filename TEXT NOT NULL UNIQUE,
+      applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )
+  `);
+  
+  const applied = new Set(
+    db.prepare("SELECT filename FROM _migrations").all()
+      .map((r: any) => r.filename)
+  );
+  
+  const pending = getMigrations().filter(m => !applied.has(m));
+  
+  if (pending.length === 0) {
+    console.log(`[${tenantId}] Up to date`);
+    return;
+  }
+  
+  for (const migration of pending) {
+    const sql = readFileSync(`./migrations/${migration}`, "utf8");
+    
+    db.transaction(() => {
+      db.exec(sql);
+      db.prepare("INSERT INTO _migrations (filename) VALUES (?)").run(migration);
+    })();
+    
+    console.log(`[${tenantId}] Applied: ${migration}`);
+  }
+}
+
+for (const tenant of getTenants()) {
+  runMigrations(tenant);
+}
+```
+
+Running `pnpm migrate` applies any pending migrations to all tenant databases in sequence. Each tenant tracks its own migration history in `_migrations`. If a migration fails for one tenant, the others aren't affected.
+
+## Backups Are Trivial
+
+SQLite has a built-in backup API. For each tenant:
+
+```bash
+#!/bin/bash
+# scripts/backup.sh
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+
+for tenant in $(ls $DATA_DIR); do
+  SOURCE="$DATA_DIR/$tenant/tenant.db"
+  DEST="/backups/$tenant/$TIMESTAMP.db"
+  
+  mkdir -p "/backups/$tenant"
+  
+  # sqlite3 .backup is hot-copy safe (works with WAL mode)
+  sqlite3 "$SOURCE" ".backup '$DEST'"
+  
+  echo "[$tenant] Backed up to $DEST"
+done
+```
+
+That's it. Each tenant has an independent backup. Restore one tenant without touching another. Copy a tenant database to a local machine for debugging. Zero ceremony.
+
+Compare this to restoring a specific tenant's rows from a shared PostgreSQL backup. It involves: exporting the full backup, importing to a temp server, querying with `WHERE tenant_id = ?`, exporting results, reimporting to production. Hours, not minutes.
+
+## Performance Isolation That Actually Works
+
+When `maxcargo` runs a report joining 50,000 orders, it affects exactly one SQLite file. The other tenants' databases are untouched. Their queries run against separate file descriptors, separate page caches, separate WAL files.
+
+WAL mode is important here. SQLite WAL allows concurrent readers while a writer is active. For a logistics platform where multiple dispatchers are checking driver status while an admin generates a report, this matters.
+
+```typescript
+// Applied once per connection when opening
+db.pragma("journal_mode = WAL");
+db.pragma("synchronous = NORMAL"); // WAL makes this safe; full sync is redundant
+db.pragma("cache_size = -64000"); // 64MB page cache per tenant
+```
+
+64MB per tenant × 8 tenants = 512MB total page cache. On a 4GB VPS, that's fine.
+
+## What Actually Broke
+
+**Too many open file descriptors.** My original implementation opened a new SQLite connection per request. Under load, I was hitting the OS limit. The fix was the connection cache I showed earlier — one connection per tenant, held open for the process lifetime.
+
+**WAL files accumulating.** SQLite WAL mode creates `-wal` and `-shm` files alongside the database. Backups need to include all three, or you'll restore an inconsistent state. The `.backup` command handles this correctly; `cp` does not.
+
+```bash
+# Wrong — inconsistent if WAL has uncommitted pages
+cp tenant.db backup.db
+
+# Right — hot backup that merges WAL
+sqlite3 tenant.db ".backup backup.db"
+```
+
+**Drizzle-ORM + per-tenant connections.** Drizzle works with a single `db` instance created at startup. For multi-tenant, I create a Drizzle instance per tenant connection:
+
+```typescript
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import * as schema from "./schema";
+
+const drizzleInstances = new Map();
+
+export function getTenantDrizzle(tenantId: string) {
+  if (!drizzleInstances.has(tenantId)) {
+    const raw = getTenantDb(tenantId);
+    drizzleInstances.set(tenantId, drizzle(raw, { schema }));
+  }
+  return drizzleInstances.get(tenantId);
+}
+```
+
+This works, but it means schema type inference is shared across tenants (same schema, different data), which is fine.
+
+**Provisioning new tenants.** With shared databases, adding a tenant is inserting a row. With per-tenant databases, it's: create directory, create empty SQLite file, run migrations, create Docker Compose stack, reload Nginx. I wrote a script for this. It's 40 lines and takes 3 seconds. Not a problem in practice, but it's friction that doesn't exist in the shared model.
+
+## When This Doesn't Make Sense
+
+Per-tenant databases make sense when:
+- You have a fixed, known set of tenants (not thousands)
+- Tenant count grows slowly (new client = new contract, not new signup)
+- Data isolation is a hard requirement (contracts, compliance, client expectation)
+- Your tenants are businesses, not individual users
+
+It doesn't make sense when:
+- You're building consumer SaaS with thousands of users
+- Your tenants need cross-tenant analytics ("show me industry benchmarks")
+- You're on managed infrastructure that doesn't handle arbitrary SQLite files
+- Teams need to share data across tenant boundaries
+
+For govantazh's use case — 4–8 freight brokers, each with 200–500 MB of operational data, zero interest in each other's data — it's the right call.
+
+## The Unexpected Benefit
+
+The best thing about this architecture wasn't performance isolation or backup simplicity. It was the development workflow.
+
+When a client reports a bug, I pull their database to my laptop:
+
+```bash
+scp user@server:data/maxcargo/tenant.db ./debug.db
+sqlite3 debug.db "SELECT * FROM orders WHERE status = 'stuck' LIMIT 5"
+```
+
+I can reproduce the exact problem with real data in 30 seconds. No fixtures, no anonymized exports, no trying to recreate state. Open the file, run queries, fix the bug.
+
+In a shared database, that means querying a production system directly — with all the risk that entails — or working with an anonymized dump that may not reproduce the actual issue.
+
+That workflow advantage alone makes per-tenant SQLite worth it for any logistics/B2B context where you have direct client relationships and operational data that needs to be debugged against reality.
+
+---
+
+The freight brokers using govantazh don't know or care how their data is stored. But when a dispatch supervisor calls at 7 PM because an order is stuck, I can diagnose and fix it in minutes — not hours. The architecture made that possible.
+
+Sometimes the "wrong" answer is right.
