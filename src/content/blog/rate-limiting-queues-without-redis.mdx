@@ -1,0 +1,458 @@
+---
+title: "Rate Limiting and Job Queues Without Redis"
+description: "Production patterns for rate limiting and background job processing using pure Node.js — no Redis, no BullMQ, no infrastructure overhead."
+pubDate: "2026-02-19"
+tags: ["nodejs", "typescript", "backend", "architecture", "queues"]
+---
+
+When you start a new project, Redis feels like overkill. You're on a single VPS, you have one Node process, and adding a Redis container just to rate-limit an API endpoint seems like premature optimization. So you skip it.
+
+Then you hit production and you need rate limiting immediately. And a job queue would really help. And you don't want to add Redis now because it means new infrastructure, new failure modes, new things to monitor.
+
+This is the pattern I've settled on: production-quality rate limiting and job queues using pure Node.js in-memory structures. It's not for every use case — I'll tell you when Redis wins — but for single-server deployments handling moderate traffic, it works well and ships fast.
+
+## The Case for In-Memory
+
+The argument for Redis as a queue backend is usually:
+- Persistence across restarts
+- Shared state across multiple processes
+- Mature ecosystem (BullMQ, Bee-Queue, etc.)
+
+All valid. But for many apps, the counter-argument is just as strong:
+- **Single process:** If you're running one Node process (common on small VPS deployments), you don't need shared state
+- **Acceptable restart loss:** Most rate limit windows are 1–60 minutes. Losing counters on restart means a brief permissive window, not data loss
+- **Simpler debugging:** `console.log(rateLimiter.counters)` beats `redis-cli HGETALL`
+- **Zero operational overhead:** No Redis down = no queue down
+
+For govantazh (multi-tenant logistics SaaS), I use in-memory queues for Nova Poshta API calls per tenant. For ecomlanding (viatex.com.ua), in-memory rate limiting handles LiqPay webhook deduplication and admin API protection. Both run fine in production.
+
+## Rate Limiting
+
+### The Sliding Window Counter
+
+The classic token bucket is elegant but overkill for most use cases. A sliding window counter is simpler to reason about and debug:
+
+```typescript
+interface WindowEntry {
+  count: number;
+  windowStart: number;
+}
+
+class SlidingWindowRateLimiter {
+  private windows = new Map<string, WindowEntry>();
+  private cleanupInterval: ReturnType<typeof setInterval>;
+
+  constructor(
+    private readonly limit: number,
+    private readonly windowMs: number
+  ) {
+    // Clean up stale entries every 5 minutes
+    this.cleanupInterval = setInterval(() => {
+      this.cleanup();
+    }, 5 * 60 * 1000);
+    
+    // Don't block process exit
+    this.cleanupInterval.unref();
+  }
+
+  check(key: string): { allowed: boolean; remaining: number; resetAt: number } {
+    const now = Date.now();
+    const entry = this.windows.get(key);
+
+    if (!entry || now - entry.windowStart >= this.windowMs) {
+      // New window
+      this.windows.set(key, { count: 1, windowStart: now });
+      return {
+        allowed: true,
+        remaining: this.limit - 1,
+        resetAt: now + this.windowMs,
+      };
+    }
+
+    if (entry.count >= this.limit) {
+      return {
+        allowed: false,
+        remaining: 0,
+        resetAt: entry.windowStart + this.windowMs,
+      };
+    }
+
+    entry.count++;
+    return {
+      allowed: true,
+      remaining: this.limit - entry.count,
+      resetAt: entry.windowStart + this.windowMs,
+    };
+  }
+
+  private cleanup() {
+    const now = Date.now();
+    for (const [key, entry] of this.windows) {
+      if (now - entry.windowStart >= this.windowMs * 2) {
+        this.windows.delete(key);
+      }
+    }
+  }
+
+  destroy() {
+    clearInterval(this.cleanupInterval);
+  }
+}
+```
+
+Usage as Hono middleware:
+
+```typescript
+import { createMiddleware } from "hono/factory";
+
+const apiLimiter = new SlidingWindowRateLimiter(100, 60_000); // 100 req/min
+
+export const rateLimit = createMiddleware(async (c, next) => {
+  // Key by IP — or use user ID for authenticated routes
+  const key = c.req.header("x-forwarded-for") ?? "unknown";
+  const result = apiLimiter.check(key);
+
+  // Always set headers — helps debugging and clients
+  c.header("X-RateLimit-Limit", String(100));
+  c.header("X-RateLimit-Remaining", String(result.remaining));
+  c.header("X-RateLimit-Reset", String(Math.ceil(result.resetAt / 1000)));
+
+  if (!result.allowed) {
+    return c.json({ error: "Too many requests" }, 429);
+  }
+
+  await next();
+});
+```
+
+### Per-Route Limiters
+
+Don't use one global limiter. Different routes have different threat profiles:
+
+```typescript
+// Tight limit for auth routes (prevents brute force)
+const authLimiter = new SlidingWindowRateLimiter(5, 15 * 60_000); // 5/15min
+
+// Moderate for admin API
+const adminLimiter = new SlidingWindowRateLimiter(200, 60_000); // 200/min
+
+// Lenient for public catalog
+const publicLimiter = new SlidingWindowRateLimiter(300, 60_000); // 300/min
+
+// Webhook endpoints — rate limit by source IP, not user
+const webhookLimiter = new SlidingWindowRateLimiter(50, 60_000); // LiqPay, NovaPoshta
+```
+
+### IP Extraction Gotcha
+
+Behind Nginx or Cloudflare, `req.socket.remoteAddress` is always your proxy IP. Use `x-forwarded-for` — but sanitize it:
+
+```typescript
+function getClientIp(c: Context): string {
+  const forwarded = c.req.header("x-forwarded-for");
+  if (forwarded) {
+    // x-forwarded-for can be comma-separated: "client, proxy1, proxy2"
+    return forwarded.split(",")[0].trim();
+  }
+  return "unknown";
+}
+```
+
+If you're behind Cloudflare, `cf-connecting-ip` is more reliable and harder to spoof.
+
+## Job Queues
+
+### The Simplest Queue That Works
+
+For background jobs — sending emails, calling external APIs, processing uploads — you often don't need persistence. You need:
+
+1. Jobs to run sequentially (avoid hammering an external API)
+2. Retries on failure
+3. Some concurrency control
+
+This does it:
+
+```typescript
+interface Job<T = void> {
+  id: string;
+  fn: () => Promise<T>;
+  retries: number;
+  maxRetries: number;
+  onSuccess?: (result: T) => void;
+  onFailure?: (error: Error) => void;
+}
+
+class SimpleQueue {
+  private queue: Job[] = [];
+  private running = false;
+  private concurrency: number;
+  private activeCount = 0;
+
+  constructor(options: { concurrency?: number } = {}) {
+    this.concurrency = options.concurrency ?? 1;
+  }
+
+  add<T>(
+    fn: () => Promise<T>,
+    options: {
+      id?: string;
+      maxRetries?: number;
+      onSuccess?: (result: T) => void;
+      onFailure?: (error: Error) => void;
+    } = {}
+  ): string {
+    const id = options.id ?? crypto.randomUUID();
+    this.queue.push({
+      id,
+      fn: fn as () => Promise<void>,
+      retries: 0,
+      maxRetries: options.maxRetries ?? 3,
+      onSuccess: options.onSuccess as ((result: void) => void) | undefined,
+      onFailure: options.onFailure,
+    });
+    this.drain();
+    return id;
+  }
+
+  get size() {
+    return this.queue.length;
+  }
+
+  get active() {
+    return this.activeCount;
+  }
+
+  private async drain() {
+    if (this.activeCount >= this.concurrency) return;
+    if (this.queue.length === 0) return;
+
+    const job = this.queue.shift()!;
+    this.activeCount++;
+
+    try {
+      const result = await job.fn();
+      job.onSuccess?.(result);
+    } catch (error) {
+      job.retries++;
+      if (job.retries < job.maxRetries) {
+        // Exponential backoff: 1s, 2s, 4s
+        const delay = Math.pow(2, job.retries - 1) * 1000;
+        setTimeout(() => {
+          this.queue.unshift(job); // Back to front of queue
+          this.drain();
+        }, delay);
+      } else {
+        job.onFailure?.(error as Error);
+        console.error(`Job ${job.id} failed after ${job.maxRetries} retries:`, error);
+      }
+    } finally {
+      this.activeCount--;
+      this.drain(); // Process next job
+    }
+  }
+}
+```
+
+### Real Usage: Nova Poshta API Rate Limiting
+
+Nova Poshta's API has undocumented rate limits. When you're creating TTNs for multiple orders simultaneously, you'll hit them. A per-tenant queue with concurrency 1 fixes this:
+
+```typescript
+// queues.ts
+const novaPoshta = new SimpleQueue({ concurrency: 1 });
+
+export async function createTTN(orderId: string, orderData: OrderData) {
+  return new Promise<TTNResult>((resolve, reject) => {
+    novaPoshta.add(
+      () => callNovaPoshtaApi(orderData),
+      {
+        id: `ttn-${orderId}`,
+        maxRetries: 3,
+        onSuccess: resolve,
+        onFailure: reject,
+      }
+    );
+  });
+}
+
+// Queue status endpoint for debugging
+app.get("/admin/queue-status", (c) => {
+  return c.json({
+    novaPoshta: {
+      queued: novaPoshta.size,
+      active: novaPoshta.active,
+    },
+  });
+});
+```
+
+### Per-Tenant Queues
+
+In govantazh, each tenant (transport company) makes Nova Poshta API calls. You don't want Tenant A's burst to delay Tenant B's jobs. Per-tenant queues solve this:
+
+```typescript
+class TenantQueueManager {
+  private queues = new Map<string, SimpleQueue>();
+  
+  getQueue(tenantId: string): SimpleQueue {
+    if (!this.queues.has(tenantId)) {
+      this.queues.set(tenantId, new SimpleQueue({ concurrency: 2 }));
+    }
+    return this.queues.get(tenantId)!;
+  }
+
+  // Clean up queues for tenants that haven't been active
+  cleanup() {
+    for (const [tenantId, queue] of this.queues) {
+      if (queue.size === 0 && queue.active === 0) {
+        // Could add last-used tracking here for more precise cleanup
+        this.queues.delete(tenantId);
+      }
+    }
+  }
+
+  stats() {
+    return Object.fromEntries(
+      Array.from(this.queues.entries()).map(([id, q]) => [
+        id,
+        { queued: q.size, active: q.active },
+      ])
+    );
+  }
+}
+
+const tenantQueues = new TenantQueueManager();
+```
+
+### Delayed Jobs
+
+Sometimes you need "run this in 5 minutes" without a scheduler. `setTimeout` is fine for short delays:
+
+```typescript
+function scheduleOnce<T>(fn: () => Promise<T>, delayMs: number): void {
+  const timer = setTimeout(async () => {
+    try {
+      await fn();
+    } catch (error) {
+      console.error("Scheduled job failed:", error);
+    }
+  }, delayMs);
+  
+  // Allow process to exit even with pending timers
+  timer.unref();
+}
+
+// Usage: send follow-up email 30 minutes after order
+scheduleOnce(
+  () => sendFollowUpEmail(orderId),
+  30 * 60 * 1000
+);
+```
+
+For longer delays (hours), this doesn't survive restarts — use a cron table in your DB instead.
+
+### Polling Loop (The Poor Man's Scheduler)
+
+When you need to check something periodically — like polling Nova Poshta for TTN status updates — an async polling loop is cleaner than `setInterval`:
+
+```typescript
+async function pollTrackingUpdates(tenantDb: Database) {
+  while (true) {
+    try {
+      const pendingTTNs = await tenantDb
+        .select()
+        .from(shipments)
+        .where(eq(shipments.status, "in_transit"))
+        .limit(50);
+
+      for (const ttn of pendingTTNs) {
+        const status = await getNovaPoshtaStatus(ttn.ttnNumber);
+        if (status !== ttn.status) {
+          await updateShipmentStatus(tenantDb, ttn.id, status);
+        }
+      }
+    } catch (error) {
+      console.error("Polling error:", error);
+      // Don't crash the loop on error
+    }
+
+    // Wait before next poll
+    await new Promise((resolve) => setTimeout(resolve, 5 * 60 * 1000));
+  }
+}
+
+// Start polling — non-blocking
+pollTrackingUpdates(db).catch(console.error);
+```
+
+The advantage over `setInterval`: each poll starts *after* the previous one completes, so slow external APIs don't cause overlapping calls.
+
+## Memory Pressure Considerations
+
+The obvious concern with in-memory queues and rate limiters: memory growth.
+
+**Rate limiters:** Each key is a few dozen bytes. 10,000 unique IPs = ~1MB. Fine.
+
+**Queues:** Jobs are closure references. If your job functions capture large objects (buffers, full DB result sets), those stay in memory until the job runs. Keep job payloads minimal:
+
+```typescript
+// Bad: captures entire order object
+queue.add(() => processOrder(fullOrderObject));
+
+// Good: capture only what you need
+const orderId = order.id;
+queue.add(() => processOrderById(orderId));
+```
+
+**Monitoring:** Add a simple health endpoint:
+
+```typescript
+app.get("/health", (c) => {
+  const memUsage = process.memoryUsage();
+  return c.json({
+    uptime: process.uptime(),
+    memory: {
+      heapUsed: Math.round(memUsage.heapUsed / 1024 / 1024) + "MB",
+      heapTotal: Math.round(memUsage.heapTotal / 1024 / 1024) + "MB",
+    },
+    queues: tenantQueues.stats(),
+  });
+});
+```
+
+## When to Actually Use Redis
+
+This approach has real limits. Reach for Redis when:
+
+- **Multiple processes:** If you run `node app.js --cluster` or multiple instances behind a load balancer, you need shared state. In-memory doesn't work.
+- **Job persistence matters:** If your jobs are financial transactions or must survive restarts, use BullMQ with Redis AOF persistence.
+- **Queue depth > 10,000:** At this scale, memory pressure becomes real and you want a proper queue with backpressure.
+- **Job scheduling:** If you need cron-style job scheduling with distributed locking, Redis + BullMQ is the right call.
+- **Multiple consumers:** BullMQ's worker model handles this well; a simple queue doesn't.
+
+For govantazh and ecomlanding, in-memory is the right trade-off: single VPS, acceptable restart loss for rate limit state, job queues that need to survive crashes go through the database anyway.
+
+## The Pattern In Practice
+
+What I actually deploy:
+
+```typescript
+// lib/rate-limiters.ts
+export const authLimiter = new SlidingWindowRateLimiter(5, 15 * 60_000);
+export const apiLimiter = new SlidingWindowRateLimiter(200, 60_000);
+export const webhookLimiter = new SlidingWindowRateLimiter(100, 60_000);
+
+// lib/queues.ts
+export const novaPoshtaQueue = new SimpleQueue({ concurrency: 1 });
+export const emailQueue = new SimpleQueue({ concurrency: 3 });
+export const tenantQueues = new TenantQueueManager();
+
+// Cleanup stale entries every 10 minutes
+setInterval(() => {
+  tenantQueues.cleanup();
+}, 10 * 60_000).unref();
+```
+
+No new npm packages. No new infrastructure. Ships in an afternoon. Handles real production traffic without drama.
+
+The lesson: reach for the simplest thing that solves the actual problem. For many single-server Node.js apps, that's a Map and a promise chain.
