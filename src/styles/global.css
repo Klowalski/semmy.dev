@@ -1,6 +1,43 @@
 @import "tailwindcss";
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
 
+/* ── OKLCH Design Tokens ─────────────────────────────────
+   Palette source: oklch.fyi Radix Slate + custom accent
+   Cyan accent hue ≈ 195, Indigo secondary ≈ 275, Pink tertiary ≈ 330
+   Slate neutrals hue ≈ 260                                          */
+@layer base {
+  :root {
+    /* Accent: Cyan — perceptually uniform scale */
+    --accent-3:  oklch(0.96 0.04 195);
+    --accent-5:  oklch(0.87 0.10 195);
+    --accent-7:  oklch(0.79 0.15 195);   /* primary — buttons, links */
+    --accent-8:  oklch(0.72 0.14 195);
+    --accent-9:  oklch(0.63 0.12 195);
+    --accent-11: oklch(0.50 0.10 195);
+
+    /* Secondary: Indigo */
+    --secondary-7: oklch(0.65 0.18 275);
+    --secondary-9: oklch(0.50 0.16 275);
+
+    /* Tertiary: Pink */
+    --tertiary-7: oklch(0.73 0.18 330);
+    --tertiary-9: oklch(0.58 0.15 330);
+
+    /* Neutrals: Slate (from oklch.fyi Radix Slate) */
+    --slate-1:  oklch(0.07 0.01 260);    /* bg deepest */
+    --slate-2:  oklch(0.10 0.01 260);    /* bg raised */
+    --slate-3:  oklch(0.14 0.01 260);    /* surface */
+    --slate-4:  oklch(0.19 0.01 260);    /* border subtle */
+    --slate-5:  oklch(0.25 0.01 260);    /* border */
+    --slate-6:  oklch(0.30 0.01 260);    /* border strong */
+    --slate-7:  oklch(0.38 0.02 260);    /* text muted */
+    --slate-8:  oklch(0.50 0.02 260);    /* text secondary */
+    --slate-9:  oklch(0.65 0.02 256);    /* text tertiary */
+    --slate-11: oklch(0.86 0.01 256);    /* text primary */
+    --slate-12: oklch(0.93 0.00 256);    /* text bright */
+  }
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -15,8 +52,8 @@ body {
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background: #080810;
-  color: #e2e8f0;
+  background: var(--slate-1);
+  color: var(--slate-11);
 }
 
 code, pre, .mono {
@@ -25,24 +62,24 @@ code, pre, .mono {
 
 /* Scrollbar */
 ::-webkit-scrollbar { width: 6px; }
-::-webkit-scrollbar-track { background: #080810; }
-::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #334155; }
+::-webkit-scrollbar-track { background: var(--slate-1); }
+::-webkit-scrollbar-thumb { background: var(--slate-4); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--slate-5); }
 
 /* Glow effects */
 .glow-cyan {
-  box-shadow: 0 0 20px rgba(34, 211, 238, 0.15), 0 0 60px rgba(34, 211, 238, 0.05);
+  box-shadow: 0 0 20px oklch(0.79 0.15 195 / 0.15), 0 0 60px oklch(0.79 0.15 195 / 0.05);
 }
 .glow-cyan:hover {
-  box-shadow: 0 0 30px rgba(34, 211, 238, 0.25), 0 0 80px rgba(34, 211, 238, 0.1);
+  box-shadow: 0 0 30px oklch(0.79 0.15 195 / 0.25), 0 0 80px oklch(0.79 0.15 195 / 0.1);
 }
 .text-glow {
-  text-shadow: 0 0 40px rgba(34, 211, 238, 0.4);
+  text-shadow: 0 0 40px oklch(0.79 0.15 195 / 0.4);
 }
 
-/* Gradient text */
+/* Gradient text — oklch interpolation for smooth hue travel */
 .gradient-text {
-  background: linear-gradient(135deg, #22d3ee 0%, #818cf8 50%, #e879f9 100%);
+  background: linear-gradient(135deg in oklch, var(--accent-7) 0%, var(--secondary-7) 50%, var(--tertiary-7) 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -56,9 +93,9 @@ code, pre, .mono {
   pointer-events: none;
   z-index: 0;
   background:
-    radial-gradient(ellipse 60% 50% at 20% 20%, rgba(34, 211, 238, 0.07) 0%, transparent 70%),
-    radial-gradient(ellipse 50% 40% at 80% 80%, rgba(129, 140, 248, 0.07) 0%, transparent 70%),
-    radial-gradient(ellipse 40% 30% at 60% 10%, rgba(232, 121, 249, 0.04) 0%, transparent 60%);
+    radial-gradient(ellipse 60% 50% at 20% 20%, oklch(0.79 0.15 195 / 0.07) 0%, transparent 70%),
+    radial-gradient(ellipse 50% 40% at 80% 80%, oklch(0.65 0.18 275 / 0.07) 0%, transparent 70%),
+    radial-gradient(ellipse 40% 30% at 60% 10%, oklch(0.73 0.18 330 / 0.04) 0%, transparent 60%);
 }
 
 /* Grid overlay */
@@ -69,29 +106,29 @@ code, pre, .mono {
   pointer-events: none;
   z-index: 0;
   background-image:
-    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+    linear-gradient(oklch(1 0 0 / 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, oklch(1 0 0 / 0.02) 1px, transparent 1px);
   background-size: 60px 60px;
   mask-image: radial-gradient(ellipse 80% 80% at 50% 50%, black 20%, transparent 100%);
 }
 
 /* Animated gradient border */
 @keyframes borderPulse {
-  0%, 100% { border-color: rgba(34, 211, 238, 0.3); }
-  50% { border-color: rgba(129, 140, 248, 0.5); }
+  0%, 100% { border-color: oklch(0.79 0.15 195 / 0.3); }
+  50% { border-color: oklch(0.65 0.18 275 / 0.5); }
 }
 
 .card-hover {
   transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  border: 1px solid rgba(255,255,255,0.06);
-  background: rgba(255,255,255,0.02);
+  border: 1px solid oklch(1 0 0 / 0.06);
+  background: oklch(1 0 0 / 0.02);
   backdrop-filter: blur(10px);
 }
 .card-hover:hover {
-  border-color: rgba(34, 211, 238, 0.4);
-  background: rgba(34, 211, 238, 0.04);
+  border-color: oklch(0.79 0.15 195 / 0.4);
+  background: oklch(0.79 0.15 195 / 0.04);
   transform: translateY(-2px);
-  box-shadow: 0 8px 40px rgba(34, 211, 238, 0.1), 0 0 0 1px rgba(34, 211, 238, 0.1);
+  box-shadow: 0 8px 40px oklch(0.79 0.15 195 / 0.1), 0 0 0 1px oklch(0.79 0.15 195 / 0.1);
 }
 
 /* Status badge */
@@ -116,8 +153,8 @@ code, pre, .mono {
 /* Nav blur */
 .nav-blur {
   backdrop-filter: blur(20px) saturate(180%);
-  background: rgba(8, 8, 16, 0.8);
-  border-bottom: 1px solid rgba(255,255,255,0.05);
+  background: oklch(0.07 0.01 260 / 0.8);
+  border-bottom: 1px solid oklch(1 0 0 / 0.05);
 }
 
 /* Tech tag */
@@ -126,9 +163,9 @@ code, pre, .mono {
   font-family: 'JetBrains Mono', monospace;
   padding: 2px 8px;
   border-radius: 4px;
-  background: rgba(34, 211, 238, 0.08);
-  color: rgba(34, 211, 238, 0.7);
-  border: 1px solid rgba(34, 211, 238, 0.15);
+  background: oklch(0.79 0.15 195 / 0.08);
+  color: oklch(0.79 0.15 195 / 0.7);
+  border: 1px solid oklch(0.79 0.15 195 / 0.15);
   letter-spacing: 0.02em;
 }
 
@@ -136,5 +173,5 @@ code, pre, .mono {
 .divider {
   border: none;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255,255,255,0.08), transparent);
+  background: linear-gradient(90deg, transparent, oklch(1 0 0 / 0.08), transparent);
 }
